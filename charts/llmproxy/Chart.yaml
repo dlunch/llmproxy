@@ -1,0 +1,6 @@
+apiVersion: v2
+name: llmproxy
+description: Subscription LLM gateway backed by an existing PostgreSQL database
+version: 0.1.0
+appVersion: "0.1.0"
+type: application

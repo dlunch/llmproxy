@@ -1,0 +1,32 @@
+[package]
+name = "llmproxy"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+async-trait = "0.1"
+async-stream = "0.3"
+axum = "0.8"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+futures-util = "0.3"
+ipnetwork = { version = "0.20", features = ["serde"] }
+prometheus-client = "0.24"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream", "form"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "postgres", "chrono", "uuid", "migrate", "macros", "ipnetwork"] }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "process", "io-util", "sync", "time", "signal"] }
+tempfile = "3"
+tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["codec", "rt"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }

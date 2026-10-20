@@ -1,0 +1,31 @@
+image:
+  repository: ghcr.io/dlunch/llmproxy
+  tag: latest
+  pullPolicy: Always
+imagePullSecrets: []
+
+# Existing Secret in the release namespace containing the PostgreSQL connection URL.
+database:
+  existingSecret: ""
+  key: DATABASE_URL
+
+# A single process owns upstream credentials. Keep grace longer than the request
+# timeout plus 30 seconds for an in-flight OAuth refresh.
+terminationGracePeriodSeconds: 180
+resources: {}
+# Pin the node architecture when supplying an architecture-specific Claude binary.
+nodeSelector: {}
+
+# Optional existing PVC containing the architecture-compatible bin/claude executable.
+claude:
+  existingClaim: ""
+
+# Keep this listener: the Service and probes use port 8080.
+config: |
+  listen = "0.0.0.0:8080"
+  max_concurrent_requests = 16
+  request_timeout_seconds = 120
+
+  [[providers]]
+  kind = "codex"
+  id = "codex-main"

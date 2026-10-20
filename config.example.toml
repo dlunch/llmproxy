@@ -1,0 +1,12 @@
+listen = "127.0.0.1:8080"
+max_concurrent_requests = 16
+request_timeout_seconds = 120
+
+[[providers]]
+kind = "codex"
+id = "codex-main"
+
+[[providers]]
+kind = "claude"
+id = "claude-main"
+executable = "/usr/local/bin/claude"
