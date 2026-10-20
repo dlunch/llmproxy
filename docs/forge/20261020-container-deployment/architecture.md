@@ -1,39 +1,34 @@
-# Container deployment architecture
+# Container and Helm architecture
 
-Build the existing Rust service as one OCI image for Linux amd64, arm64 and arm/v7. GitHub Actions distributes platform builds, then combines their pushed digests into one GHCR manifest. Kubernetes consumes that image through the Helm chart. PostgreSQL remains external.
+## Runtime image
 
-## Container and build contract
+One image contains the Rust proxy and the unmodified official Claude Code executable. Supported platforms are `linux/amd64` and `linux/arm64`, each built on a native GitHub runner. The multi-stage Dockerfile compiles Rust with the pinned Rust 1.99.1 Bookworm image, resolves the latest official Claude Code release on each image build and downloads it for the target platform, verifies its SHA-256 against the official release manifest, and copies both executables into Debian Bookworm slim. Download and build tools remain outside the runtime image. The final image runs `claude --version` during its build.
 
-The build stage uses `rust:1.99.1-bookworm` on `$BUILDPLATFORM`. amd64 and arm64 compile on their matching native Ubuntu runners. arm/v7 builds on amd64 with `gcc-arm-linux-gnueabihf` and `libc6-dev-armhf-cross`, the Rust `armv7-unknown-linux-gnueabihf` target, and the corresponding Cargo linker/CC configuration. Rust and C compilation always execute on the build platform. ARMv7 runtime package installation uses QEMU solely to run the distribution package manager; compilation is never emulated.
+Claude is installed at `/usr/local/bin/claude`; model configuration refers to that stable executable. A remote `ADD` fetches the official latest-version pointer; changed contents invalidate the subsequent download layer. Updating Claude means rebuilding and deploying the resulting image. Startup requires no release download or executable installation. The runtime contains CA certificates and the C++ runtime needed by the official binary, runs as UID/GID 1000, and uses `/tmp` as its writable home. Runtime configuration is mounted at `/etc/llmproxy/config.toml`.
 
-The runtime is `debian:bookworm-slim`, whose inspected package set already includes glibc, libgcc and libstdc++. Install ca-certificates, libatomic1 and ripgrep through the distribution package manager for the external Claude executable, and copy the compiled proxy. Run as UID/GID 1000 with `HOME=/tmp`, `LLMPROXY_CONFIG=/etc/llmproxy/config.toml`, and port 8080. PostgreSQL credentials enter through `DATABASE_URL`. A positive `.dockerignore` allowlist includes only Cargo manifests, source and migrations.
+Anthropic explicitly permits customers to preinstall the unmodified Claude Code binary in their products under the Commercial Terms. Distribution permission and authentication permission are separate: Anthropic's documentation restricts third-party product use of subscription OAuth credentials and directs developers to API-key authentication. The deployment mechanism does not change application authentication behavior.
 
-Claude is provisioned externally as an architecture-compatible executable. The upstream claude-universal workflow explicitly builds/tests without publishing its proprietary payload. The proxy image therefore contains only the proxy and distribution runtime dependencies. The Helm chart can mount the externally prepared executable; credentials and model routing follow the application's PostgreSQL contracts.
+## Helm deployment
+
+The chart deploys the same image directly as the application container, with a read-only configuration ConfigMap mount, Service, resource settings and HTTP readiness/liveness probes. Database connection settings come from a separate Secret. Database credentials and configured authentication remain in Secrets and PostgreSQL. Replica count is configurable; PostgreSQL row locks serialize provider authentication updates across replicas. An ephemeral writable `/tmp` volume provides the application home and invocation directories. No executable PVC or init container is needed because the image contains Claude.
 
 ## Publication
 
-`ubuntu-24.04` builds amd64 and cross-compiles arm/v7; `ubuntu-24.04-arm` builds arm64 natively. Pull requests build without registry login or publication. Main and version-tag pushes authenticate to GHCR using the repository token and `packages: write`, publish per-platform digests, then merge those exact digests. Main publishes `latest` and a commit tag; releases publish the version ref and commit tag. Concurrency is scoped to a workflow ref so newer changes supersede older builds without mixing artifacts from separate runs.
+The image workflow builds amd64 on `ubuntu-24.04` and arm64 on `ubuntu-24.04-arm`. Pull requests build without registry login or publication. Main and version-tag pushes authenticate to GHCR using the repository token and `packages: write`, publish per-platform digests, then merge those exact digests. Main publishes `latest` and a commit tag; releases publish the version ref and commit tag. Workflow concurrency is scoped to a Git ref.
 
-## Components and verification
+## Verification
 
-| Component | Depends on | Verification |
-|---|---|---|
-| Container/runtime (core) | Rust source and migrations | Native image build; armv7 cross build and ELF machine inspection; native process startup |
-| GitHub publication (core) | Container | Workflow/action validation; review PR/push conditions and digest merge; actual hosted run after authorized push |
-| Helm deployment | Runtime contract | Helm lint/template, Secret/config/volume wiring, probes and security context |
-
-The chart and image can be implemented in parallel after agreeing UID, config path, binary path and port. Final review checks that all three platform digests belong to the same workflow run and that armv7 never compiles under emulation. Native arm64 execution and GHCR publication are verified by the hosted workflow when available; local amd64 execution cannot substitute for either.
-
-## Sources
-
-- [Docker multi-platform builds](https://docs.docker.com/build/building/multi-platform/) documents native builders and `$BUILDPLATFORM` cross compilation.
-- [Docker multi-platform GitHub Actions](https://docs.docker.com/build/ci/github-actions/multi-platform/) documents distributing platform builds and producing a combined image.
-- [GitHub runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners) lists native Ubuntu ARM64 runners.
-- [Official Rust image](https://hub.docker.com/_/rust) lists Rust 1.99.1 Bookworm tags; the registry manifest was also inspected.
-- [claude-universal workflow](https://github.com/dlunch/claude-universal/blob/main/.github/workflows/build.yml) defines its build-only publication boundary.
-
-Project classification: backend deployment; no additional frontend/mobile guidance applies.
+Native image validation checks the official checksum and executable version, proxy startup and shutdown, API authentication and model discovery, request logging, stats and metrics. The existing real-CLI integration fixture exercises the bundled official Claude against a local API fixture. Helm lint and rendered-manifest checks validate configuration, probes, security settings and replicas. The hosted workflow verifies the native ARM64 image and final multi-platform registry manifest; local amd64 execution does not substitute for either.
 
 ## Database-backed model availability
 
-`provider_models(provider_id, model, upstream_model)` records client aliases and upstream names per provider instance, with a composite primary key and an instance foreign key. The gateway loads these routes on each request, scoped to the authenticated account and registered runtime provider IDs before calling any routing policy. Removing a model row changes availability on the next request without restarting the service. Runtime TOML registers provider implementations only; obsolete static route configuration is removed. Existing integration fixtures seed model rows and verify account isolation and runtime removal.
+`provider_models(provider_id, model, upstream_model)` records client aliases and upstream names per provider instance, with a composite primary key and an instance foreign key. The gateway loads these routes on each request, scoped to the authenticated account and registered runtime provider IDs before calling any routing policy. Removing a model row changes availability on the next request without restarting the service. Runtime TOML registers provider implementations only. Integration fixtures seed model rows and verify account isolation and runtime removal.
+
+## Sources
+
+- [Claude Code legal and compliance](https://code.claude.com/docs/en/legal-and-compliance#can-customers-offer-claude-code-in-their-products): permission to preinstall the unmodified binary and separate authentication restrictions.
+- [Claude Code setup](https://code.claude.com/docs/en/setup): official native installation and supported platforms.
+- [Docker multi-platform GitHub Actions](https://docs.docker.com/build/ci/github-actions/multi-platform/): native distributed builds and digest-based manifest publication.
+- [GitHub runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners): native Ubuntu ARM64 runners.
+
+Project classification: backend deployment; no additional frontend/mobile guidance applies.

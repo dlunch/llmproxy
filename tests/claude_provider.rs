@@ -7,7 +7,7 @@ use llmproxy::{
         ProviderEvent, Role, Tool, ToolCall, ToolChoice, WebSearchStatus,
     },
     providers::claude::ClaudeProvider,
-    store::PgStore,
+    store::{ClaudeCredentials, PgStore},
 };
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
@@ -24,6 +24,7 @@ config=pathlib.Path(os.environ['CLAUDE_CONFIG_DIR'])
 capture=pathlib.Path(__file__).parent
 credentials=json.loads((config/'.credentials.json').read_text())
 assert json.loads((config/'.claude.json').read_text())['oauthAccount']['accountUuid']=='fixture-account'
+if arg('--model')=='serialized': time.sleep(0.1)
 rotation=credentials['rotation']+1
 (config/'.credentials.json').write_text(json.dumps({'rotation':rotation}))
 # Only login state is persisted; arbitrary CLI state is discarded.
@@ -107,7 +108,11 @@ async fn auth_database() -> sqlx::PgPool {
         .parse::<sqlx::postgres::PgConnectOptions>()
         .unwrap()
         .options([("search_path", schema.as_str())]);
-    let pool = sqlx::PgPool::connect_with(options).await.unwrap();
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
     PgStore::new(pool.clone()).migrate().await.unwrap();
     let account = uuid::Uuid::new_v4();
     sqlx::query("INSERT INTO accounts(id,label) VALUES ($1,'Claude fixture')")
@@ -288,11 +293,8 @@ async fn parallel_function_handoff_preserves_calls_and_cumulative_search_usage()
     );
     assert!(!dir.path().join("unexpected-tool-response").exists());
     assert_process_terminated(dir.path()).await;
-    let saved = PgStore::new(pool)
-        .claude_credentials("claude-main")
-        .await
-        .unwrap()
-        .unwrap();
+    let saved = sqlx::query_as::<_, ClaudeCredentials>("SELECT credentials,oauth_account,user_id,has_completed_onboarding FROM claude_credentials WHERE provider_id='claude-main'")
+        .fetch_one(&pool).await.unwrap();
     assert_eq!(saved.credentials["rotation"], 1);
     assert_eq!(
         saved.oauth_account.unwrap()["accountUuid"],
@@ -389,11 +391,8 @@ async fn cancellation_and_dropped_stream_terminate_the_subprocess() {
         drop(stream);
         provider.shutdown().await;
         assert_process_terminated(dir.path()).await;
-        let saved = PgStore::new(pool)
-            .claude_credentials("claude-main")
-            .await
-            .unwrap()
-            .unwrap();
+        let saved = sqlx::query_as::<_, ClaudeCredentials>("SELECT credentials,oauth_account,user_id,has_completed_onboarding FROM claude_credentials WHERE provider_id='claude-main'")
+        .fetch_one(&pool).await.unwrap();
         assert_eq!(saved.credentials["rotation"], 1);
     }
 }
@@ -557,9 +556,19 @@ async fn actual_cli_roundtrips_parallel_calls_against_a_local_messages_api() {
 #[ignore = "requires TEST_DATABASE_URL PostgreSQL"]
 async fn concurrent_calls_reload_rotated_credentials_and_persistence_errors_fail_requests() {
     let (dir, provider, pool) = fixture().await;
+    let second_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .unwrap();
+    let second_provider = ClaudeProvider::new(
+        "claude-main".into(),
+        dir.path().join("claude"),
+        PgStore::new(second_pool),
+    );
     let first = async {
         let mut stream = provider
-            .infer(request("success"), CancellationToken::new())
+            .infer(request("serialized"), CancellationToken::new())
             .await
             .unwrap();
         while let Some(event) = stream.next().await {
@@ -567,21 +576,21 @@ async fn concurrent_calls_reload_rotated_credentials_and_persistence_errors_fail
         }
     };
     let second = async {
-        let mut stream = provider
-            .infer(request("success"), CancellationToken::new())
+        let mut stream = second_provider
+            .infer(request("serialized"), CancellationToken::new())
             .await
             .unwrap();
         while let Some(event) = stream.next().await {
             event.unwrap();
         }
     };
-    tokio::join!(first, second);
-    let store = PgStore::new(pool.clone());
-    let saved = store
-        .claude_credentials("claude-main")
-        .await
-        .unwrap()
-        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(first, second);
+    })
+    .await
+    .unwrap();
+    let saved = sqlx::query_as::<_, ClaudeCredentials>("SELECT credentials,oauth_account,user_id,has_completed_onboarding FROM claude_credentials WHERE provider_id='claude-main'")
+        .fetch_one(&pool).await.unwrap();
     assert_eq!(saved.credentials["rotation"], 2);
     assert_eq!(
         saved.oauth_account.unwrap()["accountUuid"],
@@ -592,6 +601,8 @@ async fn concurrent_calls_reload_rotated_credentials_and_persistence_errors_fail
     assert_eq!(capture["rotation"], 2);
     assert!(!Path::new(capture["config_dir"].as_str().unwrap()).exists());
 
+    sqlx::raw_sql("CREATE FUNCTION reject_auth_update() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture rejection'; END $$; CREATE TRIGGER reject_auth_update BEFORE UPDATE ON claude_credentials FOR EACH ROW EXECUTE FUNCTION reject_auth_update();")
+        .execute(&pool).await.unwrap();
     let cancellation = CancellationToken::new();
     let mut stream = provider
         .infer(request("pause"), cancellation.clone())
@@ -601,10 +612,6 @@ async fn concurrent_calls_reload_rotated_credentials_and_persistence_errors_fail
         stream.next().await.unwrap().unwrap(),
         ProviderEvent::TextDelta(_)
     ));
-    sqlx::query("DELETE FROM claude_credentials WHERE provider_id='claude-main'")
-        .execute(&pool)
-        .await
-        .unwrap();
     std::fs::write(dir.path().join("release"), "ready").unwrap();
     let mut failed = false;
     while let Some(event) = stream.next().await {

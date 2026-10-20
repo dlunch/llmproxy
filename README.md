@@ -4,7 +4,7 @@ A Rust subscription-backed LLM proxy with separate API, gateway, and provider mo
 
 - `POST /v1/chat/completions` and `POST /v1/responses`, streaming or collected.
 - Codex OAuth and HTTP inference directly, without invoking Codex CLI.
-- Claude through a [claude-universal](https://github.com/dlunch/claude-universal) executable using `claude -p`.
+- Claude through the official [Claude Code](https://code.claude.com/docs/en/overview) executable using `claude -p`.
 - Client-defined function calls/results and native web search where the provider supports them.
 - Accounts with multiple API tokens and IP CIDRs; PostgreSQL request metadata and token usage belong to the account.
 - JSON request/response and operational logs on stdout; Prometheus at `/metrics` and liveness at `/health`.
@@ -25,9 +25,9 @@ The server defaults to `127.0.0.1:8080`. Operational endpoints share the listene
 
 ## Container and Kubernetes
 
-GitHub Actions publishes `ghcr.io/dlunch/llmproxy` for `linux/amd64`, `linux/arm64`, and `linux/arm/v7`. amd64 and arm64 compile on matching native runners. ARMv7 uses the GNU cross compiler on amd64; only runtime package installation uses QEMU. Pull requests build without publishing. Main pushes publish `latest` and `sha-<full-commit>`; `v*` tags publish the tag name and commit tag. Authentication uses the workflow's `GITHUB_TOKEN` with package write permission.
+GitHub Actions publishes `ghcr.io/dlunch/llmproxy` for `linux/amd64` and `linux/arm64`, built on matching native runners. Pull requests build without publishing. Main pushes publish `latest` and `sha-<full-commit>`; `v*` tags publish the tag name and commit tag. Authentication uses the workflow's `GITHUB_TOKEN` with package write permission.
 
-The image runs as UID/GID 1000 and includes the shared libraries and ripgrep needed by an externally supplied Claude executable. It does not bundle Claude or subscription credentials. Use `listen = "0.0.0.0:8080"` in the mounted configuration and a database address reachable from the container:
+The image runs as UID/GID 1000 and bundles the unmodified official Claude Code binary. Each build resolves the official latest release and verifies its download against the official SHA-256 manifest. The remote version file participates in Docker's cache key, so a new release invalidates the download layer. Update Claude by rebuilding and deploying a new image. Subscription credentials remain in PostgreSQL. Use `listen = "0.0.0.0:8080"` in the mounted configuration and a database address reachable from the container:
 
 ```sh
 docker run --rm -p 127.0.0.1:8080:8080 \
@@ -44,7 +44,7 @@ helm upgrade --install llmproxy ./charts/llmproxy \
   --set image.tag='sha-<full-commit>'
 ```
 
-The chart uses one replica and `Recreate` updates because credential refresh locks are process-local. Claude authentication is restored from PostgreSQL into temporary storage; only the architecture-compatible Claude executable needs a volume. See the chart README for image pull Secrets, executable mounting, and architecture selection.
+The chart supports multiple replicas and rolling updates. PostgreSQL row locks serialize credential refresh across replicas. The bundled executable requires no persistent volume or startup installer. See the [chart README](charts/llmproxy/README.md) for deployment and image pull settings.
 
 ## Accounts and client authentication
 
@@ -97,7 +97,7 @@ Model mappings are read from PostgreSQL on each request. Adding or deleting a ro
 
 ### Codex
 
-`providers::codex::CodexAuth` exposes `start_device_login`, `poll_device_login`, and `refresh`. It uses the same device-authentication entrypoint and client ID as the Codex CLI; no CLI subprocess is needed. A future dashboard can call these Rust APIs. `DeviceLogin` contains the verification URL and user code. Polling yields pending, complete credentials, or expired. Refreshes are serialized per provider and persist rotated credentials before inference; shutdown drains any in-flight refresh.
+`providers::codex::CodexAuth` exposes `start_device_login`, `poll_device_login`, and `refresh`. It uses the same device-authentication entrypoint and client ID as the Codex CLI; no CLI subprocess is needed. A future dashboard can call these Rust APIs. `DeviceLogin` contains the verification URL and user code. Polling yields pending, complete credentials, or expired. Refreshes are serialized per provider across replicas with a PostgreSQL row lock and persist rotated credentials before inference; shutdown drains any in-flight refresh.
 
 For manual tests, provision credentials into the provider row using SQL. `account_id` here is the **upstream ChatGPT account ID**, distinct from a proxy account UUID:
 
@@ -112,23 +112,13 @@ Keep credential provisioning out of request logs and shell history. The authenti
 
 ### Claude
 
-Build the executable from the specified project. Pin a Claude Code release supporting the flags used below; integration fixtures were exercised with 2.1.302.
+The container includes the official executable at `/usr/local/bin/claude`. For a host installation, follow the [official setup instructions](https://code.claude.com/docs/en/setup) and set `executable` in `config.toml` to its absolute path. Establish your subscription login in a private provisioning directory:
 
 ```sh
-git clone https://github.com/dlunch/claude-universal.git
-cd claude-universal
-# Set CLAUDE_VERSION to the release you intend to run.
-docker buildx build --platform linux/amd64 \
-  --build-arg CLAUDE_VERSION="$CLAUDE_VERSION" \
-  --target executable --output type=local,dest=./dist .
-install -m 755 dist/claude /usr/local/bin/claude
+CLAUDE_CONFIG_DIR=/private/claude-login /absolute/path/to/claude auth login
 ```
 
-The executable target also supports the project's ARM targets. Follow its README for platform runtime dependencies. Set `executable` in `config.toml`. Establish a subscription login in a private provisioning directory:
-
-```sh
-CLAUDE_CONFIG_DIR=/private/claude-login /usr/local/bin/claude auth login
-```
+Anthropic documents [conditional permission to preinstall unmodified Claude Code](https://code.claude.com/docs/en/legal-and-compliance#can-customers-offer-claude-code-in-their-products). This project is intended for personal, self-hosted use; that preinstallation permission does not authorize collecting other users' Claude credentials or intermediating their subscription usage. Review the linked authentication conditions before adapting it into a third-party service.
 
 Import `.credentials.json` and the login fields from `.claude.json` into the provider's database row. The credentials and OAuth account objects are externally defined JSON documents; the user ID and onboarding flag have typed columns. Use a secure database client with bound parameters for real secrets; the following shows the row shape with placeholders:
 
@@ -139,7 +129,7 @@ VALUES ('claude-main', '<.credentials.json contents>'::jsonb,
         '<.claude.json oauthAccount object>'::jsonb, '<.claude.json userID>', true);
 ```
 
-The service restores this login data into a private temporary configuration directory for each invocation and persists refreshed credentials before completing the request. Calls using the same provider instance are serialized to avoid concurrent token refresh. Project settings, conversation history, and caches are not imported into the database.
+The service restores this login data into a private temporary configuration directory for each invocation and persists refreshed credentials before completing the request. Calls using the same provider ID are serialized across replicas with a PostgreSQL row lock held until the CLI exits and refreshed credentials are saved. Project settings, conversation history, and caches are not imported into the database.
 
 Each inference gets a private temporary working directory and a cleared process environment. Safe mode preserves subscription login while disabling user customizations; no inherited API-key/provider environment variables are passed. Built-in tools are disabled except `WebSearch` when requested. MCP configuration contains only the proxy's in-process function-schema bridge. Server shell/file tools are never exposed.
 
@@ -209,6 +199,8 @@ Prometheus exposes inference outcome counters, active requests, latency, provide
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --locked
+helm lint charts/llmproxy --set database.existingSecret=llmproxy-database
+python3 tests/helm_chart.py
 # Use a disposable PostgreSQL database; tests isolate their tables in random schemas.
 export TEST_DATABASE_URL=postgres://user:password@127.0.0.1:5432/llmproxy_test
 cargo test --locked -- --include-ignored --skip actual_cli_roundtrips
@@ -217,4 +209,4 @@ CLAUDE_TEST_EXECUTABLE=/absolute/path/to/claude \
   cargo test --locked --test claude_provider actual_cli_roundtrips -- --ignored
 ```
 
-Subprocess fixtures require Python 3. Database-dependent tests are explicitly ignored unless selected. The actual-Claude test requires both `TEST_DATABASE_URL` and `CLAUDE_TEST_EXECUTABLE`; it runs the executable against a fake local API and does not contact a real subscription account. Other provider tests use local HTTP/subprocess fixtures. See the QA report for the actual checks performed and account-dependent limitations. A single running service owns each configured upstream credential; multiple service processes sharing a refresh token require cross-process serialization before deployment.
+Subprocess fixtures require Python 3. Chart checks require Helm, Python 3.11+, and PyYAML. Database-dependent tests are explicitly ignored unless selected. The actual-Claude test requires both `TEST_DATABASE_URL` and `CLAUDE_TEST_EXECUTABLE`; it runs the executable against a fake local API and does not contact a real subscription account. Other provider tests use local HTTP/subprocess fixtures. See the QA report for the actual checks performed and account-dependent limitations. Replicas must use the same provider ID for a shared upstream credential so that PostgreSQL credential locks coordinate them.

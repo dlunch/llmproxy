@@ -63,4 +63,4 @@ The [official CLI reference](https://code.claude.com/docs/en/cli-reference) docu
 
 ## Verification boundary
 
-Authentication and inference details above were checked against source only. Claude subprocess behavior and `claude-universal` require separate source/documentation inspection. Subscription service availability, account-specific model access, and live token rotation remain unverified until account-backed smoke tests are explicitly arranged.
+Authentication and inference details above were checked against source only. Claude subprocess behavior requires separate official documentation and executable integration checks. Subscription service availability, account-specific model access, and live token rotation remain unverified until account-backed smoke tests are explicitly arranged.

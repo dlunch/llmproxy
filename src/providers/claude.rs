@@ -3,7 +3,6 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::Arc,
 };
 
 use async_trait::async_trait;
@@ -12,7 +11,7 @@ use serde_json::{Value, json};
 use tokio::{
     io::AsyncWriteExt,
     process::{ChildStdin, Command},
-    sync::{Mutex, mpsc},
+    sync::mpsc,
 };
 use tokio_util::{
     codec::{FramedRead, LinesCodec},
@@ -31,7 +30,6 @@ use crate::store::PgStore;
 pub struct ClaudeProvider {
     id: String,
     store: PgStore,
-    lock: Arc<Mutex<()>>,
     workers: TaskTracker,
     executable: PathBuf,
 }
@@ -42,7 +40,6 @@ impl ClaudeProvider {
             executable,
             id,
             store,
-            lock: Arc::new(Mutex::new(())),
             workers: TaskTracker::new(),
         }
     }
@@ -101,20 +98,10 @@ impl Provider for ClaudeProvider {
                 }
             }
         }
-        let guard = tokio::select! {
+        let (transaction, mut credentials) = tokio::select! {
             _ = cancellation.cancelled() => return Err(ProxyError::new(ErrorKind::Cancelled, "Request cancelled")),
-            guard = self.lock.clone().lock_owned() => guard,
+            locked = self.store.lock_claude_credentials(&self.id) => locked?,
         };
-        let mut credentials = self
-            .store
-            .claude_credentials(&self.id)
-            .await?
-            .ok_or_else(|| {
-                ProxyError::new(
-                    ErrorKind::UpstreamAuth,
-                    "Claude subscription credentials are not configured",
-                )
-            })?;
         let work = tempfile::tempdir().map_err(|_| {
             ProxyError::new(
                 ErrorKind::Unavailable,
@@ -299,10 +286,8 @@ impl Provider for ClaudeProvider {
         let mut stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
         let (sender, receiver) = mpsc::channel(16);
-        let store = self.store.clone();
         let id = self.id.clone();
         self.workers.spawn(async move {
-            let _guard = guard;
             let _work = work;
             let process = &mut child;
             let stream = async_stream::try_stream! {
@@ -477,7 +462,7 @@ impl Provider for ClaudeProvider {
                 if let Some(onboarding) = updated.get("hasCompletedOnboarding") {
                     credentials.has_completed_onboarding = onboarding.as_bool().ok_or_else(|| ProxyError::new(ErrorKind::Persistence, "Invalid Claude onboarding configuration"))?;
                 }
-                store.save_claude_credentials(&id, &credentials).await
+                PgStore::save_claude_credentials(transaction, &id, &credentials).await
             }.await;
             let terminal = match saved {
                 Err(error) => {
@@ -487,7 +472,6 @@ impl Provider for ClaudeProvider {
                 Ok(()) => terminal,
             };
             drop(_work);
-            drop(_guard);
             if let Some(terminal) = terminal {
                 tokio::select! {
                     permit = sender.reserve() => if let Ok(permit) = permit { permit.send(terminal); },

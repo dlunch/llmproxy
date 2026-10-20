@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, time::Duration};
 
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -7,8 +7,8 @@ use futures_util::StreamExt;
 use reqwest::{Client, Response, StatusCode, header::HeaderMap};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::{sync::Mutex, time::Instant};
-use tokio_util::sync::CancellationToken;
+use tokio::time::Instant;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::{
     core::{
@@ -293,7 +293,7 @@ pub struct CodexProvider {
     client: Client,
     auth: CodexAuth,
     responses_url: String,
-    refresh_lock: Arc<Mutex<()>>,
+    workers: TaskTracker,
 }
 
 impl CodexProvider {
@@ -310,7 +310,7 @@ impl CodexProvider {
             client,
             auth,
             responses_url,
-            refresh_lock: Arc::new(Mutex::new(())),
+            workers: TaskTracker::new(),
         }
     }
 }
@@ -318,7 +318,8 @@ impl CodexProvider {
 #[async_trait]
 impl Provider for CodexProvider {
     async fn shutdown(&self) {
-        drop(self.refresh_lock.lock().await);
+        self.workers.close();
+        self.workers.wait().await;
     }
 
     async fn infer(
@@ -373,31 +374,23 @@ impl Provider for CodexProvider {
         if cancellation.is_cancelled() {
             return Err(ProxyError::new(ErrorKind::Cancelled, "Request cancelled"));
         }
-        // shortcut: refresh locks are process-local; use database locks before deploying multiple instances.
-        let refresh_guard = tokio::select! {
+        let (transaction, credentials) = tokio::select! {
             _ = cancellation.cancelled() => return Err(ProxyError::new(ErrorKind::Cancelled, "Request cancelled")),
-            guard = self.refresh_lock.clone().lock_owned() => guard,
+            locked = self.store.lock_codex_credentials(&self.provider_id) => locked?,
         };
-        let store = self.store.clone();
         let auth = self.auth.clone();
         let provider_id = self.provider_id.clone();
         // Persist rotated tokens even if the inference request is cancelled during refresh.
-        let refresh_task = tokio::spawn(async move {
-            let _guard = refresh_guard;
-            let credentials = store
-                .load_codex_credentials(&provider_id)
-                .await?
-                .ok_or_else(|| {
-                    ProxyError::new(ErrorKind::UpstreamAuth, "Codex credentials unavailable")
-                })?;
+        let refresh_task = self.workers.spawn(async move {
             if credentials
                 .expires_at
                 .is_some_and(|expiry| expiry <= Utc::now() + chrono::Duration::seconds(60))
             {
                 let updated = auth.refresh(&credentials).await?;
-                store.save_codex_credentials(&provider_id, &updated).await?;
+                PgStore::save_codex_credentials(transaction, &provider_id, &updated).await?;
                 Ok::<_, ProxyError>(updated)
             } else {
+                transaction.commit().await.map_err(ProxyError::from)?;
                 Ok(credentials)
             }
         });

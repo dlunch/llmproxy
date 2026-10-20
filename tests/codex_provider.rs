@@ -143,7 +143,11 @@ async fn codex_streams_and_refreshes_once_with_persisted_quota_and_failure_outco
         .parse::<sqlx::postgres::PgConnectOptions>()
         .unwrap()
         .options([("search_path", schema.as_str())]);
-    let pool = sqlx::PgPool::connect_with(options).await.unwrap();
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
     let store = PgStore::new(pool.clone());
     store.migrate().await.unwrap();
     let provider_id = format!("codex-test-{}", Uuid::new_v4());
@@ -159,18 +163,8 @@ async fn codex_streams_and_refreshes_once_with_persisted_quota_and_failure_outco
         .execute(&pool)
         .await
         .unwrap();
-    store
-        .save_codex_credentials(
-            &provider_id,
-            &CodexCredentials {
-                access_token: "expired".into(),
-                refresh_token: "refresh-1".into(),
-                account_id: "workspace-1".into(),
-                expires_at: Some(chrono::Utc::now() - chrono::Duration::seconds(1)),
-            },
-        )
-        .await
-        .unwrap();
+    sqlx::query("INSERT INTO provider_credentials(provider_id,access_token,refresh_token,account_id,expires_at) VALUES ($1,'expired','refresh-1','workspace-1',now()-interval '1 second') ON CONFLICT(provider_id) DO UPDATE SET access_token='expired',refresh_token='refresh-1',expires_at=now()-interval '1 second'")
+        .bind(&provider_id).execute(&pool).await.unwrap();
     let refreshes = Arc::new(AtomicUsize::new(0));
     let counter = refreshes.clone();
     let refresh_started = Arc::new(tokio::sync::Notify::new());
@@ -264,14 +258,26 @@ async fn codex_streams_and_refreshes_once_with_persisted_quota_and_failure_outco
         provider_id.clone(),
         store.clone(),
         client.clone(),
-        CodexAuth::new(client, url.clone()),
+        CodexAuth::new(client.clone(), url.clone()),
         format!("{url}/responses"),
     ));
+    let second_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .unwrap();
+    let second_provider = CodexProvider::new(
+        provider_id.clone(),
+        PgStore::new(second_pool.clone()),
+        client.clone(),
+        CodexAuth::new(client, url.clone()),
+        format!("{url}/responses"),
+    );
     let mut system_request = request("ok");
     system_request.messages[0].role = Role::System;
     let (a, b) = tokio::join!(
         provider.infer(system_request, CancellationToken::new()),
-        provider.infer(request("ok"), CancellationToken::new())
+        second_provider.infer(request("ok"), CancellationToken::new())
     );
     let header_states = store
         .provider_states(account_id, std::slice::from_ref(&provider_id))
@@ -297,11 +303,8 @@ async fn codex_streams_and_refreshes_once_with_persisted_quota_and_failure_outco
         assert!(stream.next().await.is_none());
     }
     assert_eq!(refreshes.load(Ordering::SeqCst), 1);
-    let credentials = store
-        .load_codex_credentials(&provider_id)
-        .await
-        .unwrap()
-        .unwrap();
+    let credentials: CodexCredentials = sqlx::query_as("SELECT access_token,refresh_token,account_id,expires_at FROM provider_credentials WHERE provider_id=$1")
+        .bind(&provider_id).fetch_one(&pool).await.unwrap();
     assert_eq!(credentials.refresh_token, "rotated");
     let states = store
         .provider_states(account_id, std::slice::from_ref(&provider_id))
@@ -482,18 +485,8 @@ async fn codex_streams_and_refreshes_once_with_persisted_quota_and_failure_outco
     assert!(
         matches!(provider.infer(request("not-called"), cancelled).await, Err(error) if matches!(error.kind, ErrorKind::Cancelled))
     );
-    store
-        .save_codex_credentials(
-            &provider_id,
-            &CodexCredentials {
-                access_token: "expired".into(),
-                refresh_token: "refresh-1".into(),
-                account_id: "workspace-1".into(),
-                expires_at: Some(chrono::Utc::now() - chrono::Duration::seconds(1)),
-            },
-        )
-        .await
-        .unwrap();
+    sqlx::query("INSERT INTO provider_credentials(provider_id,access_token,refresh_token,account_id,expires_at) VALUES ($1,'expired','refresh-1','workspace-1',now()-interval '1 second') ON CONFLICT(provider_id) DO UPDATE SET access_token='expired',refresh_token='refresh-1',expires_at=now()-interval '1 second'")
+        .bind(&provider_id).execute(&pool).await.unwrap();
     let cancellation = CancellationToken::new();
     let notification = refresh_started.notified();
     tokio::pin!(notification);
@@ -512,15 +505,17 @@ async fn codex_streams_and_refreshes_once_with_persisted_quota_and_failure_outco
         .await
         .unwrap();
     assert_eq!(
-        store
-            .load_codex_credentials(&provider_id)
-            .await
-            .unwrap()
-            .unwrap()
-            .refresh_token,
+        sqlx::query_scalar::<_, String>(
+            "SELECT refresh_token FROM provider_credentials WHERE provider_id=$1"
+        )
+        .bind(&provider_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
         "rotated"
     );
     assert_eq!(refreshes.load(Ordering::SeqCst), 2);
+    second_pool.close().await;
     pool.close().await;
     sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
         .execute(&admin)

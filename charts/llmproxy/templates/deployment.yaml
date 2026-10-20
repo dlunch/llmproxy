@@ -3,9 +3,9 @@ kind: Deployment
 metadata:
   name: {{ .Release.Name }}
 spec:
-  replicas: 1
+  replicas: {{ .Values.replicaCount }}
   strategy:
-    type: Recreate
+    type: RollingUpdate
   selector:
     matchLabels:
       app.kubernetes.io/name: llmproxy
@@ -27,10 +27,6 @@ spec:
         fsGroup: 1000
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.nodeSelector }}
-      nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       containers:
@@ -71,19 +67,9 @@ spec:
               readOnly: true
             - name: tmp
               mountPath: /tmp
-            {{- if .Values.claude.existingClaim }}
-            - name: claude
-              mountPath: /var/lib/llmproxy/claude
-              readOnly: true
-            {{- end }}
       volumes:
         - name: config
           configMap:
             name: {{ .Release.Name }}-config
         - name: tmp
           emptyDir: {}
-        {{- if .Values.claude.existingClaim }}
-        - name: claude
-          persistentVolumeClaim:
-            claimName: {{ .Values.claude.existingClaim | quote }}
-        {{- end }}

@@ -13,16 +13,15 @@ missing_secret = subprocess.run(
 assert missing_secret.returncode != 0
 assert "database.existingSecret" in missing_secret.stderr
 
-for with_claude in (False, True):
+for custom_config in (False, True):
     values = {"database": {"existingSecret": "postgres", "key": "url"}}
-    if with_claude:
+    if custom_config:
         values.update({
-            "nodeSelector": {"kubernetes.io/arch": "amd64"},
-            "claude": {"existingClaim": "claude-binary"},
+            "replicaCount": 3,
             "imagePullSecrets": [{"name": "ghcr"}],
             "config": 'listen = "0.0.0.0:8080"\nrequest_timeout_seconds = 120\n'
-            '[[providers]]\nkind = "claude"\nid = "claude-main"\n'
-            'executable = "/var/lib/llmproxy/claude/bin/claude"\n',
+            '[[providers]]\nkind = "claude"\nid = "claude-secondary"\n'
+            'executable = "/usr/local/bin/claude"\n',
         })
     with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml") as file:
         yaml.safe_dump(values, file)
@@ -38,7 +37,8 @@ for with_claude in (False, True):
     container = pod["containers"][0]
     env = {item["name"]: item for item in container["env"]}
     assert config["listen"] == "0.0.0.0:8080"
-    assert deployment["replicas"] == 1 and deployment["strategy"]["type"] == "Recreate"
+    assert deployment["replicas"] == (3 if custom_config else 2)
+    assert deployment["strategy"]["type"] == "RollingUpdate"
     assert pod["terminationGracePeriodSeconds"] > config["request_timeout_seconds"] + 30
     assert env["DATABASE_URL"]["valueFrom"]["secretKeyRef"] == {"name": "postgres", "key": "url"}
     assert env["LLMPROXY_CONFIG"]["value"] == "/etc/llmproxy/config.toml"
@@ -50,12 +50,12 @@ for with_claude in (False, True):
     volumes = {item["name"]: item for item in pod["volumes"]}
     assert volumes["config"]["configMap"]["name"] == manifests["ConfigMap"]["metadata"]["name"]
     assert volumes["tmp"]["emptyDir"] == {}
-    assert ("claude" in volumes) == with_claude
-    if with_claude:
-        assert volumes["claude"]["persistentVolumeClaim"]["claimName"] == "claude-binary"
-        mount = next(item for item in container["volumeMounts"] if item["name"] == "claude")
-        assert config["providers"][0]["executable"].startswith(mount["mountPath"] + "/")
-        assert mount["readOnly"] is True
-        assert pod["nodeSelector"] == {"kubernetes.io/arch": "amd64"}
+    providers = {item["id"]: item for item in config["providers"]}
+    if custom_config:
+        assert set(providers) == {"claude-secondary"}
         assert pod["imagePullSecrets"] == [{"name": "ghcr"}]
-print("Helm render checks passed (Codex default and Claude executable PVC)")
+    else:
+        assert set(providers) == {"codex-main", "claude-main"}
+    claude = next(item for item in providers.values() if item["kind"] == "claude")
+    assert claude["executable"] == "/usr/local/bin/claude"
+print("Helm render checks passed (bundled Claude and multiple replicas)")

@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
 
 use crate::core::{AccountUsage, Credential, ErrorKind, Principal, ProxyError, Usage};
@@ -189,47 +189,49 @@ impl PgStore {
         Ok(states)
     }
 
-    pub async fn load_codex_credentials(
+    pub async fn lock_codex_credentials(
         &self,
         provider_id: &str,
-    ) -> Result<Option<CodexCredentials>, ProxyError> {
-        Ok(sqlx::query_as("SELECT access_token,refresh_token,account_id,expires_at FROM provider_credentials WHERE provider_id=$1")
-            .bind(provider_id).fetch_optional(&self.pool).await?)
+    ) -> Result<(Transaction<'static, Postgres>, CodexCredentials), ProxyError> {
+        let mut transaction = self.pool.begin().await?;
+        let credentials = sqlx::query_as("SELECT access_token,refresh_token,account_id,expires_at FROM provider_credentials WHERE provider_id=$1 FOR UPDATE")
+            .bind(provider_id).fetch_optional(&mut *transaction).await?
+            .ok_or_else(|| ProxyError::new(ErrorKind::UpstreamAuth, "Codex credentials unavailable"))?;
+        Ok((transaction, credentials))
     }
 
     pub async fn save_codex_credentials(
-        &self,
+        mut transaction: Transaction<'static, Postgres>,
         provider_id: &str,
         credentials: &CodexCredentials,
     ) -> Result<(), ProxyError> {
-        sqlx::query("INSERT INTO provider_credentials(provider_id,access_token,refresh_token,account_id,expires_at) VALUES ($1,$2,$3,$4,$5) ON CONFLICT(provider_id) DO UPDATE SET access_token=EXCLUDED.access_token,refresh_token=EXCLUDED.refresh_token,account_id=EXCLUDED.account_id,expires_at=EXCLUDED.expires_at,updated_at=now()")
+        sqlx::query("UPDATE provider_credentials SET access_token=$2,refresh_token=$3,account_id=$4,expires_at=$5,updated_at=now() WHERE provider_id=$1")
             .bind(provider_id).bind(&credentials.access_token).bind(&credentials.refresh_token)
-            .bind(&credentials.account_id).bind(credentials.expires_at).execute(&self.pool).await?;
+            .bind(&credentials.account_id).bind(credentials.expires_at).execute(&mut *transaction).await?;
+        transaction.commit().await?;
         Ok(())
     }
 
-    pub async fn claude_credentials(
+    pub async fn lock_claude_credentials(
         &self,
         provider_id: &str,
-    ) -> Result<Option<ClaudeCredentials>, ProxyError> {
-        Ok(sqlx::query_as("SELECT credentials,oauth_account,user_id,has_completed_onboarding FROM claude_credentials WHERE provider_id=$1")
-            .bind(provider_id).fetch_optional(&self.pool).await?)
+    ) -> Result<(Transaction<'static, Postgres>, ClaudeCredentials), ProxyError> {
+        let mut transaction = self.pool.begin().await?;
+        let credentials = sqlx::query_as("SELECT credentials,oauth_account,user_id,has_completed_onboarding FROM claude_credentials WHERE provider_id=$1 FOR UPDATE")
+            .bind(provider_id).fetch_optional(&mut *transaction).await?
+            .ok_or_else(|| ProxyError::new(ErrorKind::UpstreamAuth, "Claude subscription credentials are not configured"))?;
+        Ok((transaction, credentials))
     }
 
     pub async fn save_claude_credentials(
-        &self,
+        mut transaction: Transaction<'static, Postgres>,
         provider_id: &str,
         credentials: &ClaudeCredentials,
     ) -> Result<(), ProxyError> {
-        let result = sqlx::query("UPDATE claude_credentials SET credentials=$2,oauth_account=$3,user_id=$4,has_completed_onboarding=$5,updated_at=now() WHERE provider_id=$1")
+        sqlx::query("UPDATE claude_credentials SET credentials=$2,oauth_account=$3,user_id=$4,has_completed_onboarding=$5,updated_at=now() WHERE provider_id=$1")
             .bind(provider_id).bind(&credentials.credentials).bind(&credentials.oauth_account)
-            .bind(&credentials.user_id).bind(credentials.has_completed_onboarding).execute(&self.pool).await?;
-        if result.rows_affected() != 1 {
-            return Err(ProxyError::new(
-                ErrorKind::Persistence,
-                "Claude credentials were removed during inference",
-            ));
-        }
+            .bind(&credentials.user_id).bind(credentials.has_completed_onboarding).execute(&mut *transaction).await?;
+        transaction.commit().await?;
         Ok(())
     }
 

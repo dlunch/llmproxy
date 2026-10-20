@@ -12,7 +12,7 @@ Provide authenticated clients with one LLM endpoint, routing requests across sub
 - Keep gateway logic independent of HTTP and provider implementations.
 - Select providers belonging to the authenticated account using the requested model and additional conditions, including remaining usage and accumulated tokens. Expose account/provider-level request and token usage statistics from persisted records.
 - Implement Codex and Claude subscription authentication first.
-- Invoke Claude using `claude -p` built with https://github.com/dlunch/claude-universal.
+- Invoke the official Claude Code executable using `claude -p`; the deployment bundles its verified architecture-specific release.
 - Accounts own multiple API tokens, allowed IP CIDRs, and provider instances, including multiple instances of the same provider type; requests, usage, and history belong to the account. Disabling an account disables every credential.
 - Authenticate clients with API tokens stored as hashes in PostgreSQL, or allow tokenless access from account-owned IP CIDR networks stored in PostgreSQL. Use the direct TCP peer address; never trust forwarded headers by default. A supplied invalid token remains an authentication failure even from an allowed network. Token issuance and management belong to a future web dashboard; implement no management CLI or dashboard now. Seed test tokens manually with SQL.
 - Support both OpenAI-compatible Chat Completions and Responses APIs.
@@ -92,7 +92,6 @@ Provide authenticated clients with one LLM endpoint, routing requests across sub
 
 ## Research sources
 
-- https://github.com/dlunch/claude-universal (README fetched directly from main on 2026-10-20): builds standalone Claude Code executables/container images; it is not a Rust SDK.
 - https://code.claude.com/docs/en/headless: print mode, structured streaming, subprocess lifecycle, and bare-mode authentication behavior.
 - https://github.com/openai/codex/tree/091008729d5572712ac08964a9602eb71cf31428/codex-rs/login/src: verified direct authentication protocol; app-server is not used.
 - https://developers.openai.com/siwc/token-sharing-open-source/codex-app-server: an officially documented ChatGPT-plan OAuth integration route; do not assume account entitlement from a model catalog.

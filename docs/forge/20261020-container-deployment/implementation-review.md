@@ -1,17 +1,13 @@
 # Implementation review
 
-Status: accepted. No unresolved Critical, High, or Medium findings.
+Status: accepted. Final minimality review and local execution checks passed. No unresolved blocking findings.
 
-Reviewed Dockerfile, publication workflow, Helm templates, PostgreSQL model mappings, Claude credential storage and lifecycle, and their callers and integration tests. The chart now references the published `latest` tag and UID/GID 1000. Obsolete TOML routes, persistent Claude configuration directories, and Compose setup were removed.
+The final Dockerfile builds the Rust proxy natively and resolves the latest release descriptor through remote ADD and downloads the matching official Claude executable, checking its release-manifest SHA-256 before copying it unchanged into the runtime. The workflow contains only native amd64 and arm64 jobs. Helm uses the bundled executable, configurable rolling replicas and temporary storage. Obsolete executable transformation, startup update/build paths, persistent binary storage, architecture emulation and their supporting tests were removed completely.
 
-The workflow isolates per-platform build artifacts to one run, publishes only on pushes, and merges exact digests after all builds succeed. Native amd64/arm64 runners and the BUILDPLATFORM Rust stage preserve native compilation; armv7 uses the cross linker. QEMU is limited to armv7 runtime package installation.
+Claude owns its PostgreSQL credential transaction through invocation, process reaping and authentication persistence. Codex acquires the row lock, rereads current credentials and persists refresh before committing. Both save through the held connection. Waiting callers remain cancellable, and tracked active workers finish persistence during shutdown. Independent provider instances with separate single-connection pools validate cross-replica behavior.
 
-Model queries filter both account ownership and registered providers before policy selection. Credentials are hydrated inside a private temporary directory and only authentication fields are retained. Claude's per-provider lock covers load, invocation, process termination and persistence. Tracked workers handle receiver drop and cancellation; successful terminal events follow credential persistence. Function handoff also reaps the CLI before retaining rotated credentials.
+Model mappings remain filtered by account ownership and registered providers, with database changes taking effect on subsequent requests.
 
-## Persistence load
+## Persistence impact
 
-Model routing adds one account-scoped model query per inference. Each Claude invocation adds one credential read and one update, including failed or cancelled invocations after the process starts. Calls sharing a Claude provider serialize to protect refresh-token rotation; different provider instances remain independent. No request bodies or CLI transcripts are added to PostgreSQL.
-
-## Verification limits
-
-Integration tests validate application behavior and a real Claude executable against a fake local API. Live subscription authentication/rotation, hosted ARM64 execution, GHCR publication and Kubernetes rollout require their respective environments. See the QA report for completed commands and container build evidence.
+Model routing adds one account-scoped query per inference. Claude holds one connection and row lock during each invocation and updates authentication in that transaction. Calls sharing a Claude credential serialize across replicas; different credentials remain independent. Codex holds its row lock only for credential checking or refresh. No request bodies or CLI transcripts are added to PostgreSQL.

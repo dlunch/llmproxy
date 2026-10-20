@@ -3,22 +3,16 @@ image:
   tag: latest
   pullPolicy: Always
 imagePullSecrets: []
+replicaCount: 2
 
 # Existing Secret in the release namespace containing the PostgreSQL connection URL.
 database:
   existingSecret: ""
   key: DATABASE_URL
 
-# A single process owns upstream credentials. Keep grace longer than the request
-# timeout plus 30 seconds for an in-flight OAuth refresh.
+# Keep grace longer than the request timeout plus 30 seconds for an OAuth refresh.
 terminationGracePeriodSeconds: 180
 resources: {}
-# Pin the node architecture when supplying an architecture-specific Claude binary.
-nodeSelector: {}
-
-# Optional existing PVC containing the architecture-compatible bin/claude executable.
-claude:
-  existingClaim: ""
 
 # Keep this listener: the Service and probes use port 8080.
 config: |
@@ -29,3 +23,8 @@ config: |
   [[providers]]
   kind = "codex"
   id = "codex-main"
+
+  [[providers]]
+  kind = "claude"
+  id = "claude-main"
+  executable = "/usr/local/bin/claude"

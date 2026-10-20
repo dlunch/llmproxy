@@ -28,4 +28,4 @@ This is a new service, so there is no previous query baseline. Authentication pe
 
 ## Validation limits
 
-No real subscription credentials or billable upstream inference were used. Fixtures cannot establish current account entitlements, model availability, or live interoperability. Opaque Codex reasoning state is not retained across turns. Claude native context/reminders differ from a raw model API, and CLI protocol changes may require adapter updates. OAuth refresh serialization is process-local; deployment assumes one service owns each upstream credential.
+No real subscription credentials or billable upstream inference were used. Fixtures cannot establish current account entitlements, model availability, or live interoperability. Opaque Codex reasoning state is not retained across turns. Claude native context/reminders differ from a raw model API, and CLI protocol changes may require adapter updates. The subsequent container deployment work added PostgreSQL row-lock serialization for shared Codex refresh and Claude invocation credentials, enabling multiple replicas; see [deployment review](../20261020-container-deployment/implementation-review.md).

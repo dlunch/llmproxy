@@ -14,20 +14,21 @@ The Secret key defaults to `DATABASE_URL`. Supply credentials through your norma
 | `image.repository` | `ghcr.io/dlunch/llmproxy` | Multiarchitecture proxy image |
 | `image.tag` | `latest` | Use a published `sha-<commit>` tag for a pinned release |
 | `image.pullPolicy` | `Always` | Refresh the mutable `latest` tag |
+| `replicaCount` | `2` | Application replicas; credential refresh uses PostgreSQL row locks |
 | `imagePullSecrets` | `[]` | Existing registry Secrets, e.g. `[{name: ghcr}]` |
 | `database.existingSecret` | Required | Secret containing the PostgreSQL URL |
 | `database.key` | `DATABASE_URL` | URL key in the Secret |
-| `config` | Codex example | Complete TOML configuration, without credentials |
-| `claude.existingClaim` | Empty | Optional existing PVC containing `bin/claude` |
+| `config` | Codex and Claude examples | Complete TOML configuration, without credentials |
 | `terminationGracePeriodSeconds` | `180` | Graceful request and OAuth refresh shutdown |
-| `nodeSelector` | `{}` | Node labels, e.g. `{kubernetes.io/arch: amd64}` for a Claude binary |
 | `resources` | `{}` | Container resource requests and limits |
 
-Override `config` using `--set-file config=your-config.toml` or a values file. Keep `listen = "0.0.0.0:8080"` for the Service and health probes. Model IDs are examples; choose models supported by your subscription. Increase the termination grace period when increasing `request_timeout_seconds`: allow at least 30 additional seconds for an in-flight OAuth refresh plus finalization margin.
+Override `config` using `--set-file config=your-config.toml` or a values file. Keep `listen = "0.0.0.0:8080"` for the Service and health probes. Increase the termination grace period when increasing `request_timeout_seconds`: allow at least 30 additional seconds for an in-flight OAuth refresh plus finalization margin.
 
-The Deployment runs exactly one replica with `Recreate` because credential refresh locks are process-local. Do not deploy another release using the same provider credentials. Configuration changes trigger a rollout. The process runs as UID/GID 1000, with writable temporary storage at `/tmp`.
+The Deployment uses rolling updates. PostgreSQL row locks serialize credential updates across replicas. Configuration changes trigger a rollout. The process runs as UID/GID 1000, with writable temporary storage at `/tmp`.
 
-For Claude, build an architecture-compatible executable following the repository README and place it at `bin/claude` on an existing PVC, executable by UID/GID 1000. Set `claude.existingClaim` and use `executable = "/var/lib/llmproxy/claude/bin/claude"` in that provider's TOML configuration. Set `nodeSelector.kubernetes.io/arch` to the binary architecture (`amd64`, `arm64`, or `arm`). The volume is mounted read-only. Authentication is stored in PostgreSQL, not on this volume. The image does not bundle or download Claude.
+The image includes the official Claude executable at `/usr/local/bin/claude` for amd64 and arm64. Subscription credentials remain in PostgreSQL; request files use temporary storage.
+
+The default configuration enables Codex and Claude provider instances. Provision their subscription credentials and model mappings in PostgreSQL before using them.
 
 Expose the ClusterIP Service through your normal TLS/network boundary. `/health` and `/metrics` share the application listener. Use bearer tokens behind shared proxies; CIDR authentication observes the TCP peer.
 
