@@ -30,7 +30,7 @@ use crate::core::{
 };
 
 use super::{auth_json, credentials_need_refresh};
-use crate::store::PgStore;
+use crate::store::{PgStore, QuotaWindow};
 
 const DEFAULT_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const DEFAULT_SCOPES: &str = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload user:plugins";
@@ -422,9 +422,12 @@ impl Provider for ClaudeProvider {
         let stdout = child.stdout.take().expect("piped stdout");
         let (sender, receiver) = mpsc::channel(16);
         let id = self.id.clone();
+        let store = self.store.clone();
         self.workers.spawn(async move {
             let _work = work;
             let process = &mut child;
+            let mut quota = HashMap::new();
+            let quota_updates = &mut quota;
             let stream = async_stream::try_stream! {
             // The SDK control protocol exposes client functions without executing host code.
             write_message(&mut stdin, &json!({"type":"control_request","request_id":"proxy-init","request":{"subtype":"initialize","hooks":null}})).await?;
@@ -444,6 +447,19 @@ impl Provider for ClaudeProvider {
                 let Some(line) = line else { break; };
                 let message: Value = serde_json::from_str(&line).map_err(|_| ProxyError::new(ErrorKind::Upstream, "Invalid Claude output JSON"))?;
                 match message["type"].as_str() {
+                    Some("rate_limit_event") => {
+                        let observed_at = Utc::now();
+                        for name in ["five_hour", "seven_day"] {
+                            let window = &message["rate_limit_info"]["unifiedWindows"][name];
+                            let Some(utilization) = window["utilization"].as_f64().filter(|value| value.is_finite() && *value >= 0.0) else { continue; };
+                            let Some(resets_at) = window["resetsAt"].as_i64().and_then(|seconds| DateTime::from_timestamp(seconds, 0)) else { continue; };
+                            quota_updates.insert(name, QuotaWindow {
+                                key: format!("claude_{name}"), observed_at,
+                                remaining_fraction: (1.0 - utilization).max(0.0),
+                                resets_at: Some(resets_at),
+                            });
+                        }
+                    }
                     Some("control_response") if message["response"]["request_id"] == "proxy-init" => {
                         if message["response"]["subtype"] != "success" {
                             Err(ProxyError::new(ErrorKind::Upstream, "Claude initialization failed"))?;
@@ -597,11 +613,16 @@ impl Provider for ClaudeProvider {
                 if let Some(onboarding) = updated.get("hasCompletedOnboarding") {
                     credentials.has_completed_onboarding = onboarding.as_bool().ok_or_else(|| ProxyError::new(ErrorKind::Persistence, "Invalid Claude onboarding configuration"))?;
                 }
-                PgStore::save_claude_credentials(transaction, &id, &credentials).await
+                PgStore::save_claude_credentials(transaction, &id, &credentials).await?;
+                // Release the auth connection and retain rotation even if quota saving fails.
+                if !quota.is_empty() {
+                    store.save_quota(&id, &quota.into_values().collect::<Vec<_>>()).await?;
+                }
+                Ok::<_, ProxyError>(())
             }.await;
             let terminal = match saved {
                 Err(error) => {
-                    tracing::error!(provider_id=%id, error_kind=error.kind.as_str(), "Cannot persist Claude authentication");
+                    tracing::error!(provider_id=%id, error_kind=error.kind.as_str(), "Cannot persist Claude state");
                     Some(Err(error))
                 }
                 Ok(()) => terminal,

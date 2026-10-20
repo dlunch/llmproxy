@@ -1,0 +1,11 @@
+# Claude quota architecture
+
+Single backend block in the existing Claude provider. The official Claude Code 2.1.304 stream includes `rate_limit_event.rate_limit_info.unifiedWindows`, with optional `five_hour` and `seven_day` objects containing a utilization fraction and `resetsAt` in Unix seconds. Provider research verified this schema in the official executable. No additional platform guideline applies.
+
+During stream parsing, keep the latest valid observation for each of those two windows in a small per-call map. Accept finite nonnegative utilization and a representable integer reset time; derive `remaining_fraction = max(1 - utilization, 0)`. Store keys `claude_five_hour` and `claude_seven_day`, with the event receipt timestamp. Missing, invalid or unknown windows do not create or overwrite observations. Top-level status/utilization and overage fields do not substitute for explicit window measurements.
+
+The tracked subprocess worker retains collected observations through cancellation, failure and function handoff. After stopping the process and reading back authentication, commit rotated credentials first. Only then call the existing `PgStore::save_quota` before publishing the terminal event. This works with a one-connection pool, and quota write failure cannot undo the committed token rotation. Report a redacted persistence failure instead of successful completion when quota saving fails. Existing per-window monotonic observation updates prevent an earlier request from overwriting newer observations.
+
+No store schema or API change is required. The existing router continues its five-minute freshness/reset policy and conservative exclusion of exhausted base windows, including when extra usage could otherwise be available. README describes this limitation.
+
+Verification extends existing Claude integration fixtures: simultaneous five-hour/seven-day observations, partial-window updates, malformed/missing observations, utilization above one, persistence after cancellation/handoff, one-connection completion, and credential retention after quota-write failure. The existing official-CLI local-API fixture will inject quota headers if the actual CLI exposes them in that fixture. No real Anthropic request or quota polling is needed.

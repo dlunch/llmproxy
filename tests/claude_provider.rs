@@ -54,6 +54,13 @@ if json.loads(arg('--mcp-config'))['mcpServers']:
 history=[json.loads(line) for line in pathlib.Path(arg('--resume')).read_text().splitlines()] if '--resume' in args else []
 (capture/'capture.json').write_text(json.dumps({'rotation':rotation,'config_dir':str(config),'history':history,'user':user,'functions':functions,'tools':arg('--tools'),'system':pathlib.Path(arg('--system-prompt-file')).read_text()}))
 scenario=arg('--model')
+reset=int(time.time())
+if scenario=='quota-invalid':
+ emit({'type':'rate_limit_event','rate_limit_info':{'unifiedWindows':{'five_hour':{'utilization':'unknown','resetsAt':reset+3600},'seven_day':{'utilization':0.4,'resetsAt':reset+604800},'unknown':{'utilization':1,'resetsAt':reset+3600}}}})
+elif scenario!='quota-absent':
+ emit({'type':'rate_limit_event','rate_limit_info':{'status':'allowed','isUsingOverage':True,'unifiedWindows':{'five_hour':{'utilization':0.25,'resetsAt':reset+3600},'seven_day':{'utilization':1.2,'resetsAt':reset+604800}}}})
+ emit({'type':'rate_limit_event','rate_limit_info':{'unifiedWindows':{'five_hour':{'utilization':0.5,'resetsAt':reset+3600},'seven_day':{'utilization':-1,'resetsAt':'invalid'}}}})
+emit({'type':'rate_limit_event','rate_limit_info':{'status':'rejected','rateLimitType':'five_hour','utilization':1}})
 if scenario=='malformed':
  print('{broken',flush=True)
  sys.exit(0)
@@ -183,7 +190,14 @@ async fn assert_process_terminated(directory: &Path) {
 #[tokio::test]
 #[ignore = "requires TEST_DATABASE_URL PostgreSQL"]
 async fn subprocess_requires_successful_result_and_exit() {
-    for scenario in ["success", "nonzero", "malformed", "truncated"] {
+    for scenario in [
+        "success",
+        "quota-invalid",
+        "quota-absent",
+        "nonzero",
+        "malformed",
+        "truncated",
+    ] {
         let (_dir, provider, pool) = fixture().await;
         let original_timestamp: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
             "SELECT updated_at FROM claude_credentials WHERE provider_id='claude-main'",
@@ -213,7 +227,30 @@ async fn subprocess_requires_successful_result_and_exit() {
                 _ => panic!("unexpected provider event"),
             }
         }
-        if scenario == "success" {
+        let windows: Vec<(String, chrono::DateTime<chrono::Utc>, f64, chrono::DateTime<chrono::Utc>)> = sqlx::query_as("SELECT window_key,observed_at,remaining_fraction,resets_at FROM provider_quota ORDER BY window_key")
+            .fetch_all(&pool).await.unwrap();
+        match scenario {
+            "quota-absent" => assert!(windows.is_empty()),
+            "quota-invalid" => {
+                assert_eq!(windows.len(), 1);
+                assert_eq!(windows[0].0, "claude_seven_day");
+                assert_eq!(windows[0].2, 0.6);
+            }
+            _ => {
+                assert_eq!(windows.len(), 2);
+                assert_eq!(windows[0].0, "claude_five_hour");
+                assert_eq!(windows[0].2, 0.5);
+                assert_eq!(windows[1].0, "claude_seven_day");
+                assert_eq!(windows[1].2, 0.0);
+                assert!(
+                    windows[0].1 > windows[1].1,
+                    "partial updates must retain each window's observation time"
+                );
+                assert!(windows[0].3 > chrono::Utc::now());
+                assert!(windows[1].3 < chrono::Utc::now() + chrono::Duration::days(8));
+            }
+        }
+        if matches!(scenario, "success" | "quota-invalid" | "quota-absent") {
             assert_eq!(text, "hello");
             assert!(finished);
             assert!(!failed);
@@ -323,6 +360,13 @@ async fn parallel_function_handoff_preserves_calls_and_cumulative_search_usage()
     );
     assert_eq!(usage, Some((35, 12)));
     assert!(search_started && search_completed && finished);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM provider_quota")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        2
+    );
     let capture: Value =
         serde_json::from_slice(&std::fs::read(dir.path().join("capture.json")).unwrap()).unwrap();
     assert_eq!(capture["functions"][0]["name"], "lookup_weather");
@@ -433,13 +477,22 @@ async fn cancellation_and_dropped_stream_terminate_the_subprocess() {
         let saved = sqlx::query_as::<_, ClaudeCredentials>("SELECT credentials,oauth_account,user_id,has_completed_onboarding,updated_at FROM claude_credentials WHERE provider_id='claude-main'")
         .fetch_one(&pool).await.unwrap();
         assert_eq!(saved.credentials["rotation"], 1);
+        if mode != "never-polled" {
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM provider_quota")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap(),
+                2
+            );
+        }
     }
 }
 
 #[tokio::test]
 #[ignore = "requires TEST_DATABASE_URL, CLAUDE_TEST_EXECUTABLE and local socket access; uses only a fake local API"]
 async fn actual_cli_roundtrips_parallel_calls_against_a_local_messages_api() {
-    use axum::{Json, Router, extract::State, http::header, response::IntoResponse, routing::post};
+    use axum::{Json, Router, extract::State, http::header, routing::post};
     use std::sync::{Arc, Mutex};
     let executable =
         std::env::var("CLAUDE_TEST_EXECUTABLE").expect("CLAUDE_TEST_EXECUTABLE is required");
@@ -471,7 +524,14 @@ async fn actual_cli_roundtrips_parallel_calls_against_a_local_messages_api() {
             events.push(json!({"type":"message_delta","delta":{"stop_reason":if resumed {"end_turn"}else{"tool_use"},"stop_sequence":null},"usage":{"output_tokens":12}}));
             events.push(json!({"type":"message_stop"}));
             let payload=events.iter().map(|event|format!("event: {}\ndata: {}\n\n",event["type"].as_str().unwrap(),event)).collect::<String>();
-            ([(header::CONTENT_TYPE,"text/event-stream")],payload).into_response()
+            axum::response::Response::builder()
+                .header(header::CONTENT_TYPE,"text/event-stream")
+                .header("anthropic-ratelimit-unified-status","allowed")
+                .header("anthropic-ratelimit-unified-5h-utilization","0.25")
+                .header("anthropic-ratelimit-unified-5h-reset",(chrono::Utc::now().timestamp()+3600).to_string())
+                .header("anthropic-ratelimit-unified-7d-utilization","0.4")
+                .header("anthropic-ratelimit-unified-7d-reset",(chrono::Utc::now().timestamp()+604800).to_string())
+                .body(axum::body::Body::from(payload)).unwrap()
         }))
         .with_state(captured.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -480,13 +540,13 @@ async fn actual_cli_roundtrips_parallel_calls_against_a_local_messages_api() {
     let dir = tempfile::tempdir().unwrap();
     let wrapper = dir.path().join("claude-wrapper");
     let executable_json = serde_json::to_string(&executable).unwrap();
-    std::fs::write(&wrapper,format!("#!/usr/bin/env python3\nimport os,sys\nos.environ['ANTHROPIC_API_KEY']='sk-ant-api03-local-fixture-not-a-real-key'\nos.environ['ANTHROPIC_BASE_URL']='http://{address}'\nos.execv({executable_json},[{executable_json}]+sys.argv[1:])\n")).unwrap();
+    std::fs::write(&wrapper,format!("#!/usr/bin/env python3\nimport os,sys\nos.environ['CLAUDE_CODE_OAUTH_TOKEN']='local-fixture-not-a-real-token'\nos.environ['ANTHROPIC_BASE_URL']='http://{address}'\nos.execv({executable_json},[{executable_json}]+sys.argv[1:])\n")).unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
     let pool = auth_database().await;
     let provider = ClaudeProvider::new(
         "claude-main".into(),
         wrapper,
-        PgStore::new(pool),
+        PgStore::new(pool.clone()),
         ClaudeAuth::new(reqwest::Client::new(), "http://127.0.0.1:1/token".into()),
     );
     let mut initial = request("claude-sonnet-4-6");
@@ -557,6 +617,19 @@ async fn actual_cli_roundtrips_parallel_calls_against_a_local_messages_api() {
     }
     assert_eq!(text, "Forecast received.");
     assert!(finished);
+    let windows: Vec<(String, f64)> = sqlx::query_as(
+        "SELECT window_key,remaining_fraction FROM provider_quota ORDER BY window_key",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        windows,
+        vec![
+            ("claude_five_hour".into(), 0.75),
+            ("claude_seven_day".into(), 0.6)
+        ]
+    );
     let requests = captured.lock().unwrap();
     let last = requests.last().unwrap();
     let messages = last["messages"].as_array().unwrap();
@@ -645,6 +718,46 @@ async fn concurrent_calls_reload_rotated_credentials_and_persistence_errors_fail
         serde_json::from_slice(&std::fs::read(dir.path().join("capture.json")).unwrap()).unwrap();
     assert_eq!(capture["rotation"], 2);
     assert!(!Path::new(capture["config_dir"].as_str().unwrap()).exists());
+
+    sqlx::raw_sql("CREATE FUNCTION reject_quota_update() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture rejection'; END $$; CREATE TRIGGER reject_quota_update BEFORE INSERT OR UPDATE ON provider_quota FOR EACH ROW EXECUTE FUNCTION reject_quota_update();")
+        .execute(&pool).await.unwrap();
+    let mut stream = provider
+        .infer(request("success"), CancellationToken::new())
+        .await
+        .unwrap();
+    let mut quota_failed = false;
+    while let Some(event) = tokio::time::timeout(Duration::from_secs(3), stream.next())
+        .await
+        .unwrap()
+    {
+        match event {
+            Err(error) => {
+                assert!(matches!(error.kind, ErrorKind::Persistence));
+                quota_failed = true;
+            }
+            Ok(ProviderEvent::Finished(_)) => {
+                panic!("Quota persistence failure must not complete successfully")
+            }
+            Ok(_) => {}
+        }
+    }
+    assert!(quota_failed);
+    let rotated: Value = sqlx::query_scalar(
+        "SELECT credentials FROM claude_credentials WHERE provider_id='claude-main'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rotated["rotation"], 3,
+        "quota failure must not roll back rotated credentials"
+    );
+    sqlx::raw_sql(
+        "DROP TRIGGER reject_quota_update ON provider_quota; DROP FUNCTION reject_quota_update();",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
 
     sqlx::raw_sql("CREATE FUNCTION reject_auth_update() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture rejection'; END $$; CREATE TRIGGER reject_auth_update BEFORE UPDATE ON claude_credentials FOR EACH ROW EXECUTE FUNCTION reject_auth_update();")
         .execute(&pool).await.unwrap();
