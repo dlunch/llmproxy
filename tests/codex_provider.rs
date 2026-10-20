@@ -1,4 +1,4 @@
-use axum::{Json, Router, routing::post};
+use axum::{Json, Router, response::IntoResponse, routing::post};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use llmproxy::providers::codex::{CodexAuth, LoginPoll};
 use serde_json::{Value, json};
@@ -86,7 +86,7 @@ use llmproxy::{
 };
 use std::sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -169,16 +169,29 @@ async fn codex_streams_and_refreshes_once_with_persisted_quota_and_failure_outco
     let counter = refreshes.clone();
     let refresh_started = Arc::new(tokio::sync::Notify::new());
     let refresh_notification = refresh_started.clone();
+    let reject_refresh = Arc::new(AtomicBool::new(false));
+    let rejection = reject_refresh.clone();
+    let omit_expiry = Arc::new(AtomicBool::new(false));
+    let missing_expiry = omit_expiry.clone();
     let app = Router::new()
         .route("/oauth/token", post(move |Json(body): Json<Value>| {
             let counter = counter.clone();
             let notification = refresh_notification.clone();
+            let rejection = rejection.clone();
+            let missing_expiry = missing_expiry.clone();
             async move {
                 assert_eq!(body["refresh_token"], "refresh-1");
                 counter.fetch_add(1, Ordering::SeqCst);
                 notification.notify_waiters();
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                Json(json!({"access_token":"renewed", "refresh_token":"rotated", "expires_in":3600}))
+                if rejection.load(Ordering::SeqCst) {
+                    return (axum::http::StatusCode::UNAUTHORIZED, "SECRET OAuth response").into_response();
+                }
+                let mut response = json!({"access_token":"renewed", "refresh_token":"rotated"});
+                if !missing_expiry.load(Ordering::SeqCst) {
+                    response["expires_in"] = json!(3600);
+                }
+                Json(response).into_response()
             }
         }))
         .route("/responses", post(|headers: axum::http::HeaderMap, Json(body): Json<Value>| async move {
@@ -303,9 +316,78 @@ async fn codex_streams_and_refreshes_once_with_persisted_quota_and_failure_outco
         assert!(stream.next().await.is_none());
     }
     assert_eq!(refreshes.load(Ordering::SeqCst), 1);
-    let credentials: CodexCredentials = sqlx::query_as("SELECT access_token,refresh_token,account_id,expires_at FROM provider_credentials WHERE provider_id=$1")
+    let credentials: CodexCredentials = sqlx::query_as("SELECT access_token,refresh_token,account_id,expires_at,updated_at FROM provider_credentials WHERE provider_id=$1")
         .bind(&provider_id).fetch_one(&pool).await.unwrap();
     assert_eq!(credentials.refresh_token, "rotated");
+    provider.refresh_credentials().await.unwrap();
+    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+    assert!(
+        store
+            .try_lock_codex_credentials("missing-provider")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    sqlx::query("UPDATE provider_credentials SET refresh_token='refresh-1',expires_at=now()+interval '4 minutes' WHERE provider_id=$1")
+        .bind(&provider_id).execute(&pool).await.unwrap();
+    sqlx::query("UPDATE accounts SET enabled=false WHERE id=$1")
+        .bind(account_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    provider.refresh_credentials().await.unwrap();
+    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+    sqlx::query("UPDATE accounts SET enabled=true WHERE id=$1")
+        .bind(account_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (locked, _) = store.lock_codex_credentials(&provider_id).await.unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        second_provider.refresh_credentials(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+    locked.commit().await.unwrap();
+    let (first, second) = tokio::join!(
+        provider.refresh_credentials(),
+        second_provider.refresh_credentials()
+    );
+    first.unwrap();
+    second.unwrap();
+    assert_eq!(refreshes.load(Ordering::SeqCst), 2);
+
+    sqlx::query("UPDATE provider_credentials SET refresh_token='refresh-1',expires_at=now()+interval '3 days',updated_at=now()-interval '25 hours' WHERE provider_id=$1")
+        .bind(&provider_id).execute(&pool).await.unwrap();
+    provider.refresh_credentials().await.unwrap();
+    assert_eq!(refreshes.load(Ordering::SeqCst), 3);
+
+    sqlx::query("UPDATE provider_credentials SET refresh_token='refresh-1',expires_at=NULL,updated_at=now()-interval '2 hours' WHERE provider_id=$1")
+        .bind(&provider_id).execute(&pool).await.unwrap();
+    reject_refresh.store(true, Ordering::SeqCst);
+    let error = provider.refresh_credentials().await.unwrap_err();
+    assert!(matches!(error.kind, ErrorKind::UpstreamAuth));
+    assert!(!error.message.contains("SECRET"));
+    let unchanged: CodexCredentials = sqlx::query_as("SELECT access_token,refresh_token,account_id,expires_at,updated_at FROM provider_credentials WHERE provider_id=$1")
+        .bind(&provider_id).fetch_one(&pool).await.unwrap();
+    assert_eq!(unchanged.refresh_token, "refresh-1");
+    assert!(unchanged.updated_at < chrono::Utc::now() - chrono::Duration::hours(1));
+    reject_refresh.store(false, Ordering::SeqCst);
+    omit_expiry.store(true, Ordering::SeqCst);
+    provider.refresh_credentials().await.unwrap();
+    assert_eq!(refreshes.load(Ordering::SeqCst), 5);
+    let refreshed: CodexCredentials = sqlx::query_as("SELECT access_token,refresh_token,account_id,expires_at,updated_at FROM provider_credentials WHERE provider_id=$1")
+        .bind(&provider_id).fetch_one(&pool).await.unwrap();
+    assert_eq!(refreshed.refresh_token, "rotated");
+    assert!(refreshed.expires_at.is_none());
+    assert!(refreshed.updated_at > unchanged.updated_at);
+    provider.refresh_credentials().await.unwrap();
+    assert_eq!(refreshes.load(Ordering::SeqCst), 5);
+    omit_expiry.store(false, Ordering::SeqCst);
     let states = store
         .provider_states(account_id, std::slice::from_ref(&provider_id))
         .await
@@ -514,7 +596,7 @@ async fn codex_streams_and_refreshes_once_with_persisted_quota_and_failure_outco
         .unwrap(),
         "rotated"
     );
-    assert_eq!(refreshes.load(Ordering::SeqCst), 2);
+    assert_eq!(refreshes.load(Ordering::SeqCst), 6);
     second_pool.close().await;
     pool.close().await;
     sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))

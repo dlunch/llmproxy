@@ -4,11 +4,14 @@ use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
-use reqwest::{Client, Response, StatusCode, header::HeaderMap};
+use reqwest::{Client, StatusCode, header::HeaderMap};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sqlx::{Postgres, Transaction};
 use tokio::time::Instant;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
+
+use super::{auth_json, credentials_need_refresh};
 
 use crate::{
     core::{
@@ -193,36 +196,6 @@ impl CodexAuth {
     }
 }
 
-async fn auth_json(mut response: Response) -> Result<Value, ProxyError> {
-    if !response.status().is_success() {
-        return Err(ProxyError::new(
-            ErrorKind::UpstreamAuth,
-            "Codex authentication request rejected",
-        ));
-    }
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|_| {
-        ProxyError::new(
-            ErrorKind::UpstreamAuth,
-            "Codex authentication response failed",
-        )
-    })? {
-        if body.len() + chunk.len() > MAX_FRAME_BYTES {
-            return Err(ProxyError::new(
-                ErrorKind::UpstreamAuth,
-                "Codex authentication response too large",
-            ));
-        }
-        body.extend_from_slice(&chunk);
-    }
-    serde_json::from_slice(&body).map_err(|_| {
-        ProxyError::new(
-            ErrorKind::UpstreamAuth,
-            "Invalid Codex authentication response",
-        )
-    })
-}
-
 impl TokenResponse {
     fn credentials(
         self,
@@ -273,6 +246,7 @@ impl TokenResponse {
             refresh_token,
             account_id,
             expires_at,
+            updated_at: Utc::now(),
         })
     }
 }
@@ -313,10 +287,47 @@ impl CodexProvider {
             workers: TaskTracker::new(),
         }
     }
+
+    async fn refresh_locked_credentials(
+        &self,
+        transaction: Transaction<'static, Postgres>,
+        credentials: CodexCredentials,
+    ) -> Result<CodexCredentials, ProxyError> {
+        let auth = self.auth.clone();
+        let provider_id = self.provider_id.clone();
+        // Request cancellation must not discard a rotated token before persistence.
+        self.workers
+            .spawn(async move {
+                if credentials_need_refresh(credentials.expires_at, credentials.updated_at) {
+                    let updated = auth.refresh(&credentials).await?;
+                    PgStore::save_codex_credentials(transaction, &provider_id, &updated).await?;
+                    tracing::info!(provider_id, "OAuth credentials refreshed");
+                    Ok(updated)
+                } else {
+                    transaction.commit().await.map_err(ProxyError::from)?;
+                    Ok(credentials)
+                }
+            })
+            .await
+            .map_err(|_| ProxyError::new(ErrorKind::UpstreamAuth, "Codex credential task failed"))?
+    }
 }
 
 #[async_trait]
 impl Provider for CodexProvider {
+    async fn refresh_credentials(&self) -> Result<(), ProxyError> {
+        let Some((transaction, credentials)) = self
+            .store
+            .try_lock_codex_credentials(&self.provider_id)
+            .await?
+        else {
+            return Ok(());
+        };
+        self.refresh_locked_credentials(transaction, credentials)
+            .await?;
+        Ok(())
+    }
+
     async fn shutdown(&self) {
         self.workers.close();
         self.workers.wait().await;
@@ -378,25 +389,9 @@ impl Provider for CodexProvider {
             _ = cancellation.cancelled() => return Err(ProxyError::new(ErrorKind::Cancelled, "Request cancelled")),
             locked = self.store.lock_codex_credentials(&self.provider_id) => locked?,
         };
-        let auth = self.auth.clone();
-        let provider_id = self.provider_id.clone();
-        // Persist rotated tokens even if the inference request is cancelled during refresh.
-        let refresh_task = self.workers.spawn(async move {
-            if credentials
-                .expires_at
-                .is_some_and(|expiry| expiry <= Utc::now() + chrono::Duration::seconds(60))
-            {
-                let updated = auth.refresh(&credentials).await?;
-                PgStore::save_codex_credentials(transaction, &provider_id, &updated).await?;
-                Ok::<_, ProxyError>(updated)
-            } else {
-                transaction.commit().await.map_err(ProxyError::from)?;
-                Ok(credentials)
-            }
-        });
         let credentials = tokio::select! {
             _ = cancellation.cancelled() => return Err(ProxyError::new(ErrorKind::Cancelled, "Request cancelled")),
-            result = refresh_task => result.map_err(|_| ProxyError::new(ErrorKind::UpstreamAuth, "Codex credential task failed"))??,
+            result = self.refresh_locked_credentials(transaction, credentials) => result?,
         };
         let body = json!({"model":request.model, "stream":true, "store":false, "input":input,
             "tools":tools, "tool_choice":tool_choice, "parallel_tool_calls":false, "reasoning":null, "include":[]});

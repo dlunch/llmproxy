@@ -3,10 +3,14 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     process::Stdio,
+    time::Duration,
 };
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
+use reqwest::Client;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::{
     io::AsyncWriteExt,
@@ -25,19 +29,116 @@ use crate::core::{
     Role, Tool, ToolChoice, Usage, WebSearchStatus,
 };
 
+use super::{auth_json, credentials_need_refresh};
 use crate::store::PgStore;
+
+const DEFAULT_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const DEFAULT_SCOPES: &str = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload user:plugins";
+
+pub struct ClaudeAuth {
+    client: Client,
+    token_url: String,
+}
+
+#[derive(Deserialize)]
+struct TokenResponse {
+    access_token: String,
+    expires_in: i64,
+    refresh_token: Option<String>,
+    scope: Option<String>,
+    refresh_token_expires_in: Option<i64>,
+}
+
+impl ClaudeAuth {
+    pub fn new(client: Client, token_url: String) -> Self {
+        Self { client, token_url }
+    }
+
+    async fn refresh(
+        &self,
+        oauth: &mut serde_json::Map<String, Value>,
+        refresh_token: &str,
+    ) -> Result<(), ProxyError> {
+        let invalid =
+            || ProxyError::new(ErrorKind::UpstreamAuth, "Invalid Claude OAuth credentials");
+        let client_id = match oauth.get("clientId") {
+            None | Some(Value::Null) => DEFAULT_CLIENT_ID,
+            Some(value) => value
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .ok_or_else(invalid)?,
+        };
+        let scopes = match oauth.get("scopes") {
+            None | Some(Value::Null) => DEFAULT_SCOPES.to_owned(),
+            Some(Value::Array(values)) if values.is_empty() => DEFAULT_SCOPES.to_owned(),
+            Some(Value::Array(values)) => values
+                .iter()
+                .map(|scope| scope.as_str().ok_or_else(invalid))
+                .collect::<Result<Vec<_>, _>>()?
+                .join(" "),
+            Some(_) => return Err(invalid()),
+        };
+        // Matches the refresh-token exchange in the official Claude Code 2.1.304 CLI.
+        let response = self.client.post(&self.token_url)
+            .timeout(Duration::from_secs(30))
+            .json(&json!({"grant_type":"refresh_token","refresh_token":refresh_token,"client_id":client_id,"scope":scopes}))
+            .send().await.map_err(|_| ProxyError::new(ErrorKind::UpstreamAuth, "Claude credential refresh failed"))?;
+        let invalid_response =
+            || ProxyError::new(ErrorKind::UpstreamAuth, "Invalid Claude token response");
+        let tokens: TokenResponse =
+            serde_json::from_value(auth_json(response).await?).map_err(|_| invalid_response())?;
+        if tokens.access_token.is_empty()
+            || tokens.expires_in <= 0
+            || tokens.refresh_token.as_ref().is_some_and(String::is_empty)
+        {
+            return Err(invalid_response());
+        }
+        let now = Utc::now();
+        let expires = chrono::Duration::try_seconds(tokens.expires_in)
+            .and_then(|duration| now.checked_add_signed(duration))
+            .ok_or_else(invalid_response)?;
+        let refresh_expires = tokens
+            .refresh_token_expires_in
+            .map(|seconds| {
+                chrono::Duration::try_seconds(seconds)
+                    .and_then(|duration| now.checked_add_signed(duration))
+                    .ok_or_else(invalid_response)
+            })
+            .transpose()?;
+        oauth.insert("accessToken".into(), json!(tokens.access_token));
+        oauth.insert("expiresAt".into(), json!(expires.timestamp_millis()));
+        if let Some(refresh_token) = tokens.refresh_token {
+            oauth.insert("refreshToken".into(), json!(refresh_token));
+        }
+        if let Some(scope) = tokens.scope {
+            oauth.insert(
+                "scopes".into(),
+                json!(scope.split_whitespace().collect::<Vec<_>>()),
+            );
+        }
+        if let Some(expires) = refresh_expires {
+            oauth.insert(
+                "refreshTokenExpiresAt".into(),
+                json!(expires.timestamp_millis()),
+            );
+        }
+        Ok(())
+    }
+}
 
 pub struct ClaudeProvider {
     id: String,
     store: PgStore,
     workers: TaskTracker,
     executable: PathBuf,
+    auth: ClaudeAuth,
 }
 
 impl ClaudeProvider {
-    pub fn new(id: String, executable: PathBuf, store: PgStore) -> Self {
+    pub fn new(id: String, executable: PathBuf, store: PgStore, auth: ClaudeAuth) -> Self {
         Self {
             executable,
+            auth,
             id,
             store,
             workers: TaskTracker::new(),
@@ -47,6 +148,40 @@ impl ClaudeProvider {
 
 #[async_trait]
 impl Provider for ClaudeProvider {
+    async fn refresh_credentials(&self) -> Result<(), ProxyError> {
+        let Some((transaction, mut credentials)) =
+            self.store.try_lock_claude_credentials(&self.id).await?
+        else {
+            return Ok(());
+        };
+        let oauth = credentials
+            .credentials
+            .get_mut("claudeAiOauth")
+            .and_then(Value::as_object_mut);
+        let eligible = oauth.and_then(|oauth| {
+            let token = oauth
+                .get("refreshToken")
+                .and_then(Value::as_str)
+                .filter(|token| !token.is_empty())?
+                .to_owned();
+            Some((oauth, token))
+        });
+        let Some((oauth, refresh_token)) = eligible else {
+            transaction.commit().await?;
+            return Ok(());
+        };
+        let expires_at = oauth
+            .get("expiresAt")
+            .and_then(Value::as_i64)
+            .and_then(DateTime::from_timestamp_millis);
+        if !credentials_need_refresh(expires_at, credentials.updated_at) {
+            transaction.commit().await?;
+            return Ok(());
+        }
+        self.auth.refresh(oauth, &refresh_token).await?;
+        PgStore::save_claude_credentials(transaction, &self.id, &credentials).await
+    }
+
     async fn shutdown(&self) {
         self.workers.close();
         self.workers.wait().await;

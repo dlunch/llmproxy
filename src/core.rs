@@ -124,6 +124,10 @@ pub trait Provider: Send + Sync {
         cancellation: CancellationToken,
     ) -> Result<EventStream, ProxyError>;
 
+    async fn refresh_credentials(&self) -> Result<(), ProxyError> {
+        Ok(())
+    }
+
     async fn shutdown(&self) {}
 }
 

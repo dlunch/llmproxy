@@ -7,12 +7,14 @@ use llmproxy::{
     gateway::{Gateway, LeastUsedPolicy},
     metrics::Metrics,
     providers::{
-        claude::ClaudeProvider,
+        claude::{ClaudeAuth, ClaudeProvider},
         codex::{CodexAuth, CodexProvider},
+        maintain_credentials,
     },
     store::PgStore,
 };
 use sqlx::postgres::PgPoolOptions;
+use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -68,12 +70,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             ProviderConfig::Claude { id, executable } => {
                 providers.insert(
                     id.clone(),
-                    Arc::new(ClaudeProvider::new(id, executable, store.clone())),
+                    Arc::new(ClaudeProvider::new(
+                        id,
+                        executable,
+                        store.clone(),
+                        ClaudeAuth::new(
+                            client.clone(),
+                            "https://platform.claude.com/v1/oauth/token".into(),
+                        ),
+                    )),
                 );
             }
         }
     }
     let metrics = Arc::new(Metrics::default());
+    let maintenance_providers = providers.clone();
     let gateway = Arc::new(Gateway::new(
         store.clone(),
         providers,
@@ -87,6 +98,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         store: store.clone(),
         metrics,
     });
+    let listener = tokio::net::TcpListener::bind(config.listen).await?;
+    let maintenance_stop = CancellationToken::new();
+    let maintenance = tokio::spawn(maintain_credentials(
+        maintenance_providers,
+        maintenance_stop.clone(),
+    ));
     let reconciliation = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
         loop {
@@ -99,13 +116,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     });
-    let listener = tokio::net::TcpListener::bind(config.listen).await?;
+    let shutdown_maintenance = maintenance_stop.clone();
     tracing::info!(listen=%config.listen, "LLM proxy started");
     let result = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(async {
+    .with_graceful_shutdown(async move {
         #[cfg(unix)]
         {
             let mut terminate =
@@ -117,11 +134,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         {
             let _ = tokio::signal::ctrl_c().await;
         }
+        shutdown_maintenance.cancel();
         tracing::info!("LLM proxy shutting down");
     })
     .await;
+    maintenance_stop.cancel();
+    let maintenance_result = maintenance.await;
     gateway.shutdown().await;
     reconciliation.abort();
+    maintenance_result?;
     result?;
     Ok(())
 }

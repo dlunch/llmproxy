@@ -15,6 +15,7 @@ pub struct CodexCredentials {
     pub refresh_token: String,
     pub account_id: String,
     pub expires_at: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -23,6 +24,7 @@ pub struct ClaudeCredentials {
     pub oauth_account: Option<serde_json::Value>,
     pub user_id: Option<String>,
     pub has_completed_onboarding: bool,
+    pub updated_at: DateTime<Utc>,
 }
 
 pub struct QuotaWindow {
@@ -194,10 +196,20 @@ impl PgStore {
         provider_id: &str,
     ) -> Result<(Transaction<'static, Postgres>, CodexCredentials), ProxyError> {
         let mut transaction = self.pool.begin().await?;
-        let credentials = sqlx::query_as("SELECT access_token,refresh_token,account_id,expires_at FROM provider_credentials WHERE provider_id=$1 FOR UPDATE")
+        let credentials = sqlx::query_as("SELECT access_token,refresh_token,account_id,expires_at,updated_at FROM provider_credentials WHERE provider_id=$1 FOR UPDATE")
             .bind(provider_id).fetch_optional(&mut *transaction).await?
             .ok_or_else(|| ProxyError::new(ErrorKind::UpstreamAuth, "Codex credentials unavailable"))?;
         Ok((transaction, credentials))
+    }
+
+    pub async fn try_lock_codex_credentials(
+        &self,
+        provider_id: &str,
+    ) -> Result<Option<(Transaction<'static, Postgres>, CodexCredentials)>, ProxyError> {
+        let mut transaction = self.pool.begin().await?;
+        let credentials = sqlx::query_as("SELECT c.access_token,c.refresh_token,c.account_id,c.expires_at,c.updated_at FROM provider_credentials c JOIN provider_instances p ON p.id=c.provider_id JOIN accounts a ON a.id=p.account_id WHERE c.provider_id=$1 AND a.enabled AND c.refresh_token<>'' FOR UPDATE OF c SKIP LOCKED")
+            .bind(provider_id).fetch_optional(&mut *transaction).await?;
+        Ok(credentials.map(|credentials| (transaction, credentials)))
     }
 
     pub async fn save_codex_credentials(
@@ -217,10 +229,20 @@ impl PgStore {
         provider_id: &str,
     ) -> Result<(Transaction<'static, Postgres>, ClaudeCredentials), ProxyError> {
         let mut transaction = self.pool.begin().await?;
-        let credentials = sqlx::query_as("SELECT credentials,oauth_account,user_id,has_completed_onboarding FROM claude_credentials WHERE provider_id=$1 FOR UPDATE")
+        let credentials = sqlx::query_as("SELECT credentials,oauth_account,user_id,has_completed_onboarding,updated_at FROM claude_credentials WHERE provider_id=$1 FOR UPDATE")
             .bind(provider_id).fetch_optional(&mut *transaction).await?
             .ok_or_else(|| ProxyError::new(ErrorKind::UpstreamAuth, "Claude subscription credentials are not configured"))?;
         Ok((transaction, credentials))
+    }
+
+    pub async fn try_lock_claude_credentials(
+        &self,
+        provider_id: &str,
+    ) -> Result<Option<(Transaction<'static, Postgres>, ClaudeCredentials)>, ProxyError> {
+        let mut transaction = self.pool.begin().await?;
+        let credentials = sqlx::query_as("SELECT c.credentials,c.oauth_account,c.user_id,c.has_completed_onboarding,c.updated_at FROM claude_credentials c JOIN provider_instances p ON p.id=c.provider_id JOIN accounts a ON a.id=p.account_id WHERE c.provider_id=$1 AND a.enabled AND NULLIF(c.credentials #>> '{claudeAiOauth,refreshToken}','') IS NOT NULL FOR UPDATE OF c SKIP LOCKED")
+            .bind(provider_id).fetch_optional(&mut *transaction).await?;
+        Ok(credentials.map(|credentials| (transaction, credentials)))
     }
 
     pub async fn save_claude_credentials(
@@ -228,7 +250,7 @@ impl PgStore {
         provider_id: &str,
         credentials: &ClaudeCredentials,
     ) -> Result<(), ProxyError> {
-        sqlx::query("UPDATE claude_credentials SET credentials=$2,oauth_account=$3,user_id=$4,has_completed_onboarding=$5,updated_at=now() WHERE provider_id=$1")
+        sqlx::query("UPDATE claude_credentials SET credentials=$2,oauth_account=$3,user_id=$4,has_completed_onboarding=$5,updated_at=CASE WHEN credentials #> '{claudeAiOauth,accessToken}' IS DISTINCT FROM $2::jsonb #> '{claudeAiOauth,accessToken}' OR credentials #> '{claudeAiOauth,refreshToken}' IS DISTINCT FROM $2::jsonb #> '{claudeAiOauth,refreshToken}' OR credentials #> '{claudeAiOauth,expiresAt}' IS DISTINCT FROM $2::jsonb #> '{claudeAiOauth,expiresAt}' THEN now() ELSE updated_at END WHERE provider_id=$1")
             .bind(provider_id).bind(&credentials.credentials).bind(&credentials.oauth_account)
             .bind(&credentials.user_id).bind(credentials.has_completed_onboarding).execute(&mut *transaction).await?;
         transaction.commit().await?;

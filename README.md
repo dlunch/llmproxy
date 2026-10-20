@@ -95,6 +95,12 @@ VALUES ('codex-main', 'codex', 'gpt-5.4'),
 
 Model mappings are read from PostgreSQL on each request. Adding or deleting a row changes availability without restarting the service; TOML contains only transport/provider configuration.
 
+### Automatic OAuth refresh
+
+While the service is running, configured providers belonging to enabled accounts are checked at startup and every minute, even without inference traffic. Access tokens are refreshed within five minutes of expiry, or after 24 hours without a successful token update. Credentials without an access-token expiry are refreshed hourly. These checks call only OAuth endpoints and do not generate billable model requests.
+
+PostgreSQL row locks coordinate refresh with inference and other replicas; shutdown waits for in-flight refreshes to be saved. Failed attempts are retried on the next check. Revoked refresh tokens and absolute login expiry still require a new login, and credentials cannot be maintained while the service is stopped.
+
 ### Codex
 
 `providers::codex::CodexAuth` exposes `start_device_login`, `poll_device_login`, and `refresh`. It uses the same device-authentication entrypoint and client ID as the Codex CLI; no CLI subprocess is needed. A future dashboard can call these Rust APIs. `DeviceLogin` contains the verification URL and user code. Polling yields pending, complete credentials, or expired. Refreshes are serialized per provider across replicas with a PostgreSQL row lock and persist rotated credentials before inference; shutdown drains any in-flight refresh.

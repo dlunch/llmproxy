@@ -6,7 +6,7 @@ use llmproxy::{
         ErrorKind, FinishReason, FunctionDefinition, InferenceRequest, Message, Provider,
         ProviderEvent, Role, Tool, ToolCall, ToolChoice, WebSearchStatus,
     },
-    providers::claude::ClaudeProvider,
+    providers::claude::{ClaudeAuth, ClaudeProvider},
     store::{ClaudeCredentials, PgStore},
 };
 use serde_json::{Value, json};
@@ -26,7 +26,9 @@ credentials=json.loads((config/'.credentials.json').read_text())
 assert json.loads((config/'.claude.json').read_text())['oauthAccount']['accountUuid']=='fixture-account'
 if arg('--model')=='serialized': time.sleep(0.1)
 rotation=credentials['rotation']+1
-(config/'.credentials.json').write_text(json.dumps({'rotation':rotation}))
+credentials['rotation']=rotation
+if 'claudeAiOauth' in credentials: credentials['claudeAiOauth']['accessToken']+='-cli'
+(config/'.credentials.json').write_text(json.dumps(credentials))
 # Only login state is persisted; arbitrary CLI state is discarded.
 (config/'.claude.json').write_text(json.dumps({'hasCompletedOnboarding':True,'projects':{'private':'discard'}}))
 (capture/'pid').write_text(str(os.getpid()))
@@ -92,7 +94,12 @@ async fn fixture() -> (tempfile::TempDir, ClaudeProvider, sqlx::PgPool) {
     std::fs::write(&script, FIXTURE).unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
     let pool = auth_database().await;
-    let provider = ClaudeProvider::new("claude-main".into(), script, PgStore::new(pool.clone()));
+    let provider = ClaudeProvider::new(
+        "claude-main".into(),
+        script,
+        PgStore::new(pool.clone()),
+        ClaudeAuth::new(reqwest::Client::new(), "http://127.0.0.1:1/token".into()),
+    );
     (dir, provider, pool)
 }
 
@@ -177,7 +184,13 @@ async fn assert_process_terminated(directory: &Path) {
 #[ignore = "requires TEST_DATABASE_URL PostgreSQL"]
 async fn subprocess_requires_successful_result_and_exit() {
     for scenario in ["success", "nonzero", "malformed", "truncated"] {
-        let (_dir, provider, _pool) = fixture().await;
+        let (_dir, provider, pool) = fixture().await;
+        let original_timestamp: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+            "SELECT updated_at FROM claude_credentials WHERE provider_id='claude-main'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         let mut stream = provider
             .infer(request(scenario), CancellationToken::new())
             .await
@@ -205,6 +218,32 @@ async fn subprocess_requires_successful_result_and_exit() {
             assert!(finished);
             assert!(!failed);
             assert_eq!(usage, Some((6, 4)));
+            let after: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+                "SELECT updated_at FROM claude_credentials WHERE provider_id='claude-main'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                after, original_timestamp,
+                "non-OAuth CLI state must not postpone refresh"
+            );
+            sqlx::query("UPDATE claude_credentials SET credentials=jsonb_set(credentials,'{claudeAiOauth}', '{\"accessToken\":\"before-cli\"}'),updated_at=now()-interval '2 hours'")
+                .execute(&pool).await.unwrap();
+            let mut refreshed = provider
+                .infer(request("success"), CancellationToken::new())
+                .await
+                .unwrap();
+            while let Some(event) = refreshed.next().await {
+                event.unwrap();
+            }
+            let after_rotation: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+                "SELECT updated_at FROM claude_credentials WHERE provider_id='claude-main'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert!(after_rotation >= original_timestamp);
         } else {
             assert!(!finished, "{scenario} incorrectly completed");
             assert!(failed, "{scenario} did not fail");
@@ -293,7 +332,7 @@ async fn parallel_function_handoff_preserves_calls_and_cumulative_search_usage()
     );
     assert!(!dir.path().join("unexpected-tool-response").exists());
     assert_process_terminated(dir.path()).await;
-    let saved = sqlx::query_as::<_, ClaudeCredentials>("SELECT credentials,oauth_account,user_id,has_completed_onboarding FROM claude_credentials WHERE provider_id='claude-main'")
+    let saved = sqlx::query_as::<_, ClaudeCredentials>("SELECT credentials,oauth_account,user_id,has_completed_onboarding,updated_at FROM claude_credentials WHERE provider_id='claude-main'")
         .fetch_one(&pool).await.unwrap();
     assert_eq!(saved.credentials["rotation"], 1);
     assert_eq!(
@@ -391,7 +430,7 @@ async fn cancellation_and_dropped_stream_terminate_the_subprocess() {
         drop(stream);
         provider.shutdown().await;
         assert_process_terminated(dir.path()).await;
-        let saved = sqlx::query_as::<_, ClaudeCredentials>("SELECT credentials,oauth_account,user_id,has_completed_onboarding FROM claude_credentials WHERE provider_id='claude-main'")
+        let saved = sqlx::query_as::<_, ClaudeCredentials>("SELECT credentials,oauth_account,user_id,has_completed_onboarding,updated_at FROM claude_credentials WHERE provider_id='claude-main'")
         .fetch_one(&pool).await.unwrap();
         assert_eq!(saved.credentials["rotation"], 1);
     }
@@ -444,7 +483,12 @@ async fn actual_cli_roundtrips_parallel_calls_against_a_local_messages_api() {
     std::fs::write(&wrapper,format!("#!/usr/bin/env python3\nimport os,sys\nos.environ['ANTHROPIC_API_KEY']='sk-ant-api03-local-fixture-not-a-real-key'\nos.environ['ANTHROPIC_BASE_URL']='http://{address}'\nos.execv({executable_json},[{executable_json}]+sys.argv[1:])\n")).unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
     let pool = auth_database().await;
-    let provider = ClaudeProvider::new("claude-main".into(), wrapper, PgStore::new(pool));
+    let provider = ClaudeProvider::new(
+        "claude-main".into(),
+        wrapper,
+        PgStore::new(pool),
+        ClaudeAuth::new(reqwest::Client::new(), "http://127.0.0.1:1/token".into()),
+    );
     let mut initial = request("claude-sonnet-4-6");
     initial.tools = vec![function()];
     let mut stream = provider
@@ -565,6 +609,7 @@ async fn concurrent_calls_reload_rotated_credentials_and_persistence_errors_fail
         "claude-main".into(),
         dir.path().join("claude"),
         PgStore::new(second_pool),
+        ClaudeAuth::new(reqwest::Client::new(), "http://127.0.0.1:1/token".into()),
     );
     let first = async {
         let mut stream = provider
@@ -589,7 +634,7 @@ async fn concurrent_calls_reload_rotated_credentials_and_persistence_errors_fail
     })
     .await
     .unwrap();
-    let saved = sqlx::query_as::<_, ClaudeCredentials>("SELECT credentials,oauth_account,user_id,has_completed_onboarding FROM claude_credentials WHERE provider_id='claude-main'")
+    let saved = sqlx::query_as::<_, ClaudeCredentials>("SELECT credentials,oauth_account,user_id,has_completed_onboarding,updated_at FROM claude_credentials WHERE provider_id='claude-main'")
         .fetch_one(&pool).await.unwrap();
     assert_eq!(saved.credentials["rotation"], 2);
     assert_eq!(
@@ -627,4 +672,179 @@ async fn concurrent_calls_reload_rotated_credentials_and_persistence_errors_fail
     assert!(failed);
     provider.shutdown().await;
     assert_process_terminated(dir.path()).await;
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL PostgreSQL and local socket access"]
+async fn idle_oauth_refresh_preserves_credentials_and_coordinates_replicas() {
+    use axum::{
+        Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::post,
+    };
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+    type OAuthState = (Arc<Mutex<Vec<Value>>>, Arc<AtomicUsize>);
+    let calls = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let mode = Arc::new(AtomicUsize::new(0));
+    let app = Router::new().route("/token", post(|State((calls, mode)): State<OAuthState>, Json(body): Json<Value>| async move {
+        assert_eq!(body["grant_type"], "refresh_token");
+        calls.lock().unwrap().push(body);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        match mode.load(Ordering::SeqCst) {
+            0 => Json(json!({"access_token":"new-access","refresh_token":"rotated","expires_in":3600,"refresh_token_expires_in":86400,"scope":"user:inference custom:scope"})).into_response(),
+            1 => Json(json!({"access_token":"newer-access","expires_in":3600})).into_response(),
+            2 => (StatusCode::UNAUTHORIZED, "SECRET rejected token").into_response(),
+            3 => "{SECRET malformed".into_response(),
+            4 => Json(json!({"access_token":"SECRET missing-expiry"})).into_response(),
+            _ => "x".repeat(1024 * 1024 + 1).into_response(),
+        }
+    })).with_state((calls.clone(), mode.clone()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let pool = auth_database().await;
+    let second_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .unwrap();
+    let first = ClaudeProvider::new(
+        "claude-main".into(),
+        "/must-not-run-claude".into(),
+        PgStore::new(pool.clone()),
+        ClaudeAuth::new(reqwest::Client::new(), endpoint.clone()),
+    );
+    let second = ClaudeProvider::new(
+        "claude-main".into(),
+        "/must-not-run-claude".into(),
+        PgStore::new(second_pool),
+        ClaudeAuth::new(reqwest::Client::new(), endpoint),
+    );
+    let imported = json!({"otherCredential":{"retain":true},"claudeAiOauth":{"accessToken":"old-access","refreshToken":"old-refresh","expiresAt":0,"refreshTokenExpiresAt":123456,"clientId":"custom-client","scopes":["user:inference","custom:scope"],"subscriptionType":"max","unknown":{"retain":true}}});
+    sqlx::query("UPDATE claude_credentials SET credentials=$1 WHERE provider_id='claude-main'")
+        .bind(&imported)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (a, b) = tokio::join!(first.refresh_credentials(), second.refresh_credentials());
+    a.unwrap();
+    b.unwrap();
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    assert_eq!(calls.lock().unwrap()[0]["client_id"], "custom-client");
+    assert_eq!(
+        calls.lock().unwrap()[0]["scope"],
+        "user:inference custom:scope"
+    );
+    let updated: Value = sqlx::query_scalar(
+        "SELECT credentials FROM claude_credentials WHERE provider_id='claude-main'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(updated["otherCredential"], imported["otherCredential"]);
+    assert_eq!(
+        updated["claudeAiOauth"]["unknown"],
+        imported["claudeAiOauth"]["unknown"]
+    );
+    assert_eq!(updated["claudeAiOauth"]["subscriptionType"], "max");
+    assert_eq!(updated["claudeAiOauth"]["refreshToken"], "rotated");
+    assert!(
+        updated["claudeAiOauth"]["expiresAt"].as_i64().unwrap()
+            > chrono::Utc::now().timestamp_millis()
+    );
+    first.refresh_credentials().await.unwrap();
+    assert_eq!(calls.lock().unwrap().len(), 1);
+
+    mode.store(1, Ordering::SeqCst);
+    sqlx::query("UPDATE claude_credentials SET credentials=jsonb_set(credentials,'{claudeAiOauth,expiresAt}','null'),updated_at=now()-interval '2 hours' WHERE provider_id='claude-main'").execute(&pool).await.unwrap();
+    first.refresh_credentials().await.unwrap();
+    let refreshed: Value = sqlx::query_scalar(
+        "SELECT credentials FROM claude_credentials WHERE provider_id='claude-main'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(refreshed["claudeAiOauth"]["refreshToken"], "rotated");
+    assert_eq!(
+        refreshed["claudeAiOauth"]["refreshTokenExpiresAt"],
+        updated["claudeAiOauth"]["refreshTokenExpiresAt"]
+    );
+    assert_eq!(
+        refreshed["claudeAiOauth"]["scopes"],
+        updated["claudeAiOauth"]["scopes"]
+    );
+    assert_eq!(calls.lock().unwrap().len(), 2);
+
+    for failure in 2..=5 {
+        mode.store(failure, Ordering::SeqCst);
+        sqlx::query("UPDATE claude_credentials SET credentials=$1 WHERE provider_id='claude-main'")
+            .bind(&imported)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let error = first
+            .refresh_credentials()
+            .await
+            .expect_err("invalid refresh must fail");
+        assert!(matches!(error.kind, ErrorKind::UpstreamAuth));
+        assert!(!error.message.contains("SECRET"));
+        let retained: Value = sqlx::query_scalar(
+            "SELECT credentials FROM claude_credentials WHERE provider_id='claude-main'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(retained, imported);
+    }
+    mode.store(1, Ordering::SeqCst);
+    first.refresh_credentials().await.unwrap();
+    sqlx::query("UPDATE claude_credentials SET credentials=$1 WHERE provider_id='claude-main'")
+        .bind(json!({"claudeAiOauth":{"accessToken":"old","refreshToken":"default-refresh","expiresAt":0}})).execute(&pool).await.unwrap();
+    first.refresh_credentials().await.unwrap();
+    let default_call = calls.lock().unwrap().last().unwrap().clone();
+    assert_eq!(
+        default_call["client_id"],
+        "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+    );
+    assert_eq!(
+        default_call["scope"],
+        "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload user:plugins"
+    );
+    let successful_calls = calls.lock().unwrap().len();
+    let store = PgStore::new(pool.clone());
+    let (lock, _) = store.lock_claude_credentials("claude-main").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), second.refresh_credentials())
+        .await
+        .unwrap()
+        .unwrap();
+    lock.rollback().await.unwrap();
+    sqlx::query("UPDATE claude_credentials SET credentials=$1 WHERE provider_id='claude-main'")
+        .bind(&imported)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE accounts SET enabled=false")
+        .execute(&pool)
+        .await
+        .unwrap();
+    first.refresh_credentials().await.unwrap();
+    sqlx::query("UPDATE accounts SET enabled=true")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE claude_credentials SET credentials='{}'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    first.refresh_credentials().await.unwrap();
+    sqlx::query("DELETE FROM claude_credentials WHERE provider_id='claude-main'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    first.refresh_credentials().await.unwrap();
+    assert_eq!(calls.lock().unwrap().len(), successful_calls);
+    server.abort();
 }
