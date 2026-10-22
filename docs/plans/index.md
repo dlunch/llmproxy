@@ -2,6 +2,7 @@
 
 | Date | Task | Details |
 |---|---|---|
+| 2026-10-22 | Request-path latency optimization | [Implementation and measurements](20261022-request-latency.md) |
 | 2026-10-20 | Claude response quota collection | [Implementation record](20261020-claude-quota.md) |
 | 2026-10-20 | Background OAuth refresh | [Implementation record](20261020-oauth-refresh.md) |
 | 2026-10-20 | Container deployment and provider configuration | [Implementation record](20261020-container-deployment.md) |

@@ -166,7 +166,7 @@ impl PgStore {
     ) -> Result<Vec<ProviderState>, ProxyError> {
         let usage: Vec<(String, i64)> = sqlx::query_as("SELECT p.id, COALESCE(SUM(COALESCE(r.input_tokens,0)::numeric + COALESCE(r.output_tokens,0)::numeric),0)::bigint FROM provider_instances p LEFT JOIN requests r ON r.provider_id=p.id AND r.account_id=p.account_id WHERE p.account_id=$1 AND p.id=ANY($2) GROUP BY p.id")
             .bind(account_id).bind(provider_ids).fetch_all(&self.pool).await?;
-        let eligible_ids: Vec<_> = usage.iter().map(|(id, _)| id.clone()).collect();
+        let eligible_ids: Vec<_> = usage.iter().map(|(id, _)| id.as_str()).collect();
         let quotas = sqlx::query("SELECT provider_id,window_key,observed_at,remaining_fraction,resets_at FROM provider_quota WHERE provider_id=ANY($1)")
             .bind(&eligible_ids).fetch_all(&self.pool).await?;
         let mut states: Vec<_> = usage

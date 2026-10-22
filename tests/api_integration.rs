@@ -86,6 +86,14 @@ impl Provider for FakeProvider {
             .messages
             .iter()
             .any(|message| message.content == "fail");
+        let benchmark = request
+            .messages
+            .last()
+            .is_some_and(|message| message.content == "benchmark");
+        let changed_call = request
+            .messages
+            .last()
+            .is_some_and(|message| message.content == "changed call");
         self.observed.lock().unwrap().push(
             request
                 .messages
@@ -105,6 +113,30 @@ impl Provider for FakeProvider {
                 })
                 .collect(),
         );
+        if benchmark {
+            return Ok(Box::pin(futures_util::stream::iter(
+                (0..2048)
+                    .map(|_| Ok(ProviderEvent::TextDelta("x".repeat(64))))
+                    .chain([Ok(ProviderEvent::Finished(FinishReason::Stop))]),
+            )));
+        }
+        if changed_call {
+            return Ok(Box::pin(futures_util::stream::iter([
+                Ok(ProviderEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call_1".into()),
+                    name: Some("weather".into()),
+                    arguments: "{".into(),
+                }),
+                Ok(ProviderEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call_2".into()),
+                    name: None,
+                    arguments: "}".into(),
+                }),
+                Ok(ProviderEvent::Finished(FinishReason::ToolCalls)),
+            ])));
+        }
         if tool_call {
             return Ok(Box::pin(futures_util::stream::iter(vec![
                 Ok(ProviderEvent::ToolCallDelta {
@@ -171,6 +203,81 @@ impl Provider for FakeProvider {
                 ))
             },
         ])))
+    }
+}
+
+#[tokio::test]
+#[ignore = "manual release latency benchmark; requires TEST_DATABASE_URL"]
+async fn proxy_latency_benchmark() {
+    for concurrency in [1, 4] {
+        for (endpoint, streaming) in [
+            ("/v1/chat/completions", false),
+            ("/v1/chat/completions", true),
+            ("/v1/responses", false),
+            ("/v1/responses", true),
+        ] {
+            let fixture = Fixture::new().await;
+            let input = "a".repeat(128 * 1024);
+            let body = if endpoint == "/v1/chat/completions" {
+            json!({"model":"test","messages":[{"role":"user","content":input},{"role":"user","content":"benchmark"}],"stream":streaming})
+        } else {
+            json!({"model":"test","input":[{"role":"user","content":input},{"role":"user","content":"benchmark"}],"stream":streaming})
+        }.to_string();
+            let mut first = Vec::new();
+            let mut total = Vec::new();
+            for iteration in 0..105 {
+                let samples = futures_util::future::join_all((0..concurrency).map(|_| async {
+                    let request = Request::builder()
+                        .method("POST")
+                        .uri(endpoint)
+                        .header("authorization", format!("Bearer {}", fixture.token))
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.clone()))
+                        .unwrap();
+                    let started = std::time::Instant::now();
+                    let response = fixture.app.clone().oneshot(request).await.unwrap();
+                    assert_eq!(response.status(), StatusCode::OK);
+                    let mut response_body = response.into_body();
+                    let frame = response_body.frame().await.unwrap().unwrap();
+                    let first_elapsed = started.elapsed();
+                    assert!(!frame.into_data().unwrap().is_empty());
+                    let remaining = response_body.collect().await.unwrap().to_bytes();
+                    let elapsed = started.elapsed();
+                    if streaming {
+                        assert!(std::str::from_utf8(&remaining).unwrap().contains(
+                            if endpoint == "/v1/chat/completions" {
+                                "[DONE]"
+                            } else {
+                                "response.completed"
+                            }
+                        ));
+                    }
+                    (
+                        first_elapsed.as_secs_f64() * 1000.0,
+                        elapsed.as_secs_f64() * 1000.0,
+                    )
+                }))
+                .await;
+                if iteration >= 5 {
+                    for (first_ms, total_ms) in samples {
+                        first.push(first_ms);
+                        total.push(total_ms);
+                    }
+                }
+                fixture.observed.lock().unwrap().clear();
+            }
+            first.sort_by(f64::total_cmp);
+            total.sort_by(f64::total_cmp);
+            println!(
+                "{endpoint} stream={streaming} concurrency={concurrency} n={} first_ms p50={:.3} p95={:.3} total_ms p50={:.3} p95={:.3}",
+                first.len(),
+                first[first.len() / 2],
+                first[first.len() * 95 / 100],
+                total[total.len() / 2],
+                total[total.len() * 95 / 100]
+            );
+            fixture.cleanup().await;
+        }
     }
 }
 
@@ -643,6 +750,26 @@ async fn client_function_calls_round_trip_through_both_protocols() {
     assert_eq!(events[5]["type"], "response.function_call_arguments.done");
     assert_eq!(events[5]["arguments"], "{\"city\":\"Seoul\"}");
     assert!(!body.contains("response.content_part"));
+    for endpoint in ["/v1/chat/completions", "/v1/responses"] {
+        for stream in [false, true] {
+            let request = if endpoint == "/v1/chat/completions" {
+                json!({"model":"test","messages":[{"role":"user","content":"changed call"}],"stream":stream})
+            } else {
+                json!({"model":"test","input":"changed call","stream":stream})
+            };
+            let (status, body) = fixture.post(endpoint, request).await;
+            assert_eq!(
+                status,
+                if stream {
+                    StatusCode::OK
+                } else {
+                    StatusCode::BAD_GATEWAY
+                }
+            );
+            assert!(body.contains("Function call identity changed during streaming"));
+            assert!(!body.contains("[DONE]") && !body.contains("response.completed"));
+        }
+    }
     fixture.cleanup().await;
 }
 

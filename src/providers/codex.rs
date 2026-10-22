@@ -367,15 +367,24 @@ impl Provider for CodexProvider {
                 input.push(json!({"type":"function_call", "call_id":call.id, "name":call.name, "arguments":call.arguments}));
             }
         }
-        let tools: Vec<_> = request.tools.into_iter().map(|tool| match tool {
-            Tool::WebSearch => json!({"type":"web_search"}),
-            Tool::Function(function) => {
-                let mut tool = json!({"type":"function", "name":function.name, "parameters":function.parameters});
-                if let Some(description) = function.description { tool["description"] = json!(description); }
-                if let Some(strict) = function.strict { tool["strict"] = json!(strict); }
-                tool
-            }
-        }).collect();
+        let tools: Vec<_> = request
+            .tools
+            .into_iter()
+            .map(|tool| match tool {
+                Tool::WebSearch => json!({"type":"web_search"}),
+                Tool::Function(function) => {
+                    let mut tool = json!({"type":"function", "name":function.name});
+                    tool["parameters"] = function.parameters;
+                    if let Some(description) = function.description {
+                        tool["description"] = json!(description);
+                    }
+                    if let Some(strict) = function.strict {
+                        tool["strict"] = json!(strict);
+                    }
+                    tool
+                }
+            })
+            .collect();
         let tool_choice = match request.tool_choice {
             ToolChoice::Auto => json!("auto"),
             ToolChoice::None => json!("none"),
@@ -393,8 +402,11 @@ impl Provider for CodexProvider {
             _ = cancellation.cancelled() => return Err(ProxyError::new(ErrorKind::Cancelled, "Request cancelled")),
             result = self.refresh_locked_credentials(transaction, credentials) => result?,
         };
-        let body = json!({"model":request.model, "stream":true, "store":false, "input":input,
-            "tools":tools, "tool_choice":tool_choice, "parallel_tool_calls":false, "reasoning":null, "include":[]});
+        let mut body = json!({"model":request.model, "stream":true, "store":false,
+            "parallel_tool_calls":false, "reasoning":null, "include":[]});
+        body["input"] = Value::Array(input);
+        body["tools"] = Value::Array(tools);
+        body["tool_choice"] = tool_choice;
         let response = tokio::select! {
             _ = cancellation.cancelled() => return Err(ProxyError::new(ErrorKind::Cancelled, "Request cancelled")),
             response = self.client.post(&self.responses_url)
@@ -442,12 +454,15 @@ impl Provider for CodexProvider {
                     if line.last() == Some(&b'\r') { line.pop(); }
                     if line.is_empty() {
                         if data.is_empty() { continue; }
-                        let event: Value = serde_json::from_slice(&data)
+                        let mut event: Value = serde_json::from_slice(&data)
                             .map_err(|_| ProxyError::new(ErrorKind::Upstream, "Malformed Codex stream event"))?;
                         data.clear();
                         match event["type"].as_str() {
                             Some("response.output_text.delta") => {
-                                let delta = event["delta"].as_str().ok_or_else(|| ProxyError::new(ErrorKind::Upstream, "Malformed Codex text event"))?;
+                                let delta = match event["delta"].take() {
+                                    Value::String(delta) => delta,
+                                    _ => Err(ProxyError::new(ErrorKind::Upstream, "Malformed Codex text event"))?,
+                                };
                                 let characters = delta.chars().count();
                                 if let (Some(output), Some(content)) = (event["output_index"].as_u64(), event["content_index"].as_u64()) {
                                     let (start, length) = text_parts.entry((output, content)).or_insert((text_characters, 0));
@@ -457,7 +472,7 @@ impl Provider for CodexProvider {
                                     *length += characters;
                                 }
                                 text_characters += characters;
-                                yield ProviderEvent::TextDelta(delta.to_owned());
+                                yield ProviderEvent::TextDelta(delta);
                             }
                             Some("response.output_item.added" | "response.output_item.done") => {
                                 let item = &event["item"];

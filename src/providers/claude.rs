@@ -337,17 +337,20 @@ impl Provider for ClaudeProvider {
         };
         let session = Uuid::new_v4().to_string();
         let mut parent = None::<String>;
-        let mut history = String::new();
+        let mut history = Vec::new();
         for (role, blocks) in conversation {
             let id = Uuid::new_v4().to_string();
-            let message = if role == "assistant" {
-                json!({"role":role,"content":blocks,"id":format!("msg_{id}"),"type":"message","model":request.model,"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}})
+            let mut message = if role == "assistant" {
+                json!({"role":role,"id":format!("msg_{id}"),"type":"message","model":request.model,"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}})
             } else {
-                json!({"role":role,"content":blocks})
+                json!({"role":role})
             };
-            let record = json!({"type":role,"message":message,"uuid":id,"parentUuid":parent,"sessionId":session,"timestamp":chrono::Utc::now(),"isSidechain":false,"cwd":work.path(),"userType":"external"});
-            history.push_str(&record.to_string());
-            history.push('\n');
+            message["content"] = Value::Array(blocks);
+            let mut record = json!({"type":role,"uuid":id,"parentUuid":parent,"sessionId":session,"timestamp":chrono::Utc::now(),"isSidechain":false,"cwd":work.path(),"userType":"external"});
+            record["message"] = message;
+            serde_json::to_writer(&mut history, &record)
+                .expect("JSON values serialize into memory");
+            history.push(b'\n');
             parent = Some(id);
         }
         let system_path = work.path().join("system.txt");
@@ -445,7 +448,7 @@ impl Provider for ClaudeProvider {
                     None => None,
                 };
                 let Some(line) = line else { break; };
-                let message: Value = serde_json::from_str(&line).map_err(|_| ProxyError::new(ErrorKind::Upstream, "Invalid Claude output JSON"))?;
+                let mut message: Value = serde_json::from_str(&line).map_err(|_| ProxyError::new(ErrorKind::Upstream, "Invalid Claude output JSON"))?;
                 match message["type"].as_str() {
                     Some("rate_limit_event") => {
                         let observed_at = Utc::now();
@@ -481,7 +484,7 @@ impl Provider for ClaudeProvider {
                         write_message(stdin.as_mut().ok_or_else(|| ProxyError::new(ErrorKind::Upstream, "Unexpected Claude control request"))?, &json!({"type":"control_response","response":{"subtype":"success","request_id":message["request_id"],"response":{"mcp_response":{"jsonrpc":"2.0","id":rpc["id"],"result":rpc_result}}}})).await?;
                     }
                     Some("stream_event") => {
-                        let event = &message["event"];
+                        let event = &mut message["event"];
                         match event["type"].as_str() {
                             Some("message_start") => {
                                 let id = event["message"]["id"].as_str().ok_or_else(|| ProxyError::new(ErrorKind::Upstream, "Invalid Claude message ID"))?;
@@ -489,8 +492,11 @@ impl Provider for ClaudeProvider {
                                 if let Some(usage) = parse_usage(&event["message"]["usage"])? { usages.insert(id.into(), usage); }
                             }
                             Some("content_block_delta") if event["delta"]["type"] == "text_delta" => {
-                                let text = event["delta"]["text"].as_str().ok_or_else(|| ProxyError::new(ErrorKind::Upstream, "Invalid Claude text delta"))?;
-                                yield ProviderEvent::TextDelta(text.into());
+                                let text = match event["delta"]["text"].take() {
+                                    Value::String(text) => text,
+                                    _ => Err(ProxyError::new(ErrorKind::Upstream, "Invalid Claude text delta"))?,
+                                };
+                                yield ProviderEvent::TextDelta(text);
                             }
                             Some("message_delta") => {
                                 if let (Some(usage), Some(output)) = (current_message.as_ref().and_then(|id| usages.get_mut(id)), event["usage"].get("output_tokens")) {

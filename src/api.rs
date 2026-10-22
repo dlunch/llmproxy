@@ -509,7 +509,7 @@ async fn chat(
     )
     .await?;
     let Json(request_body) = body.map_err(|_| invalid("Invalid Chat Completions JSON request"))?;
-    let body: ChatRequest = serde_json::from_value(request_body.clone())
+    let body = ChatRequest::deserialize(&request_body)
         .map_err(|_| invalid("Invalid or unsupported Chat Completions request"))?;
     if body.n.is_some_and(|n| n != 1) {
         return Err(invalid("Only n=1 is supported"));
@@ -525,12 +525,9 @@ async fn chat(
         Some(Value::String(text)) if !text.is_empty() => vec![text],
         Some(Value::Array(values)) if !values.is_empty() && values.len() <= 4 => values
             .into_iter()
-            .map(|value| {
-                value
-                    .as_str()
-                    .filter(|text| !text.is_empty())
-                    .map(str::to_owned)
-                    .ok_or_else(|| invalid("Invalid stop sequence"))
+            .map(|value| match value {
+                Value::String(text) if !text.is_empty() => Ok(text),
+                _ => Err(invalid("Invalid stop sequence")),
             })
             .collect::<Result<Vec<_>, _>>()?,
         _ => return Err(invalid("stop must contain one to four nonempty strings")),
@@ -584,7 +581,7 @@ async fn responses(
     )
     .await?;
     let Json(request_body) = body.map_err(|_| invalid("Invalid Responses JSON request"))?;
-    let body: ResponsesRequest = serde_json::from_value(request_body.clone())
+    let body = ResponsesRequest::deserialize(&request_body)
         .map_err(|_| invalid("Invalid or unsupported Responses request"))?;
     if body.store == Some(true) {
         return Err(invalid("Stored responses are not supported"));

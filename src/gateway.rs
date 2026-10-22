@@ -46,7 +46,7 @@ impl RoutingPolicy for LeastUsedPolicy {
     ) -> Result<usize, ProxyError> {
         let now = Utc::now();
         let mut model_exists = false;
-        let mut candidates = Vec::new();
+        let mut selected: Option<(usize, &ProviderState)> = None;
         for (index, route) in routes
             .iter()
             .enumerate()
@@ -63,28 +63,27 @@ impl RoutingPolicy for LeastUsedPolicy {
                             < chrono::Duration::minutes(5)
                         && window.resets_at.is_none_or(|reset| reset > now)
                 });
-                if !exhausted {
-                    candidates.push((index, state));
+                if !exhausted
+                    && selected.is_none_or(|(previous_index, previous)| {
+                        (state.accumulated_tokens, &state.provider_id, index)
+                            < (
+                                previous.accumulated_tokens,
+                                &previous.provider_id,
+                                previous_index,
+                            )
+                    })
+                {
+                    selected = Some((index, state));
                 }
             }
         }
-        candidates
-            .into_iter()
-            .min_by(|(left_index, left), (right_index, right)| {
-                (left.accumulated_tokens, &left.provider_id, left_index).cmp(&(
-                    right.accumulated_tokens,
-                    &right.provider_id,
-                    right_index,
-                ))
-            })
-            .map(|(index, _)| index)
-            .ok_or_else(|| {
-                if model_exists {
-                    ProxyError::new(ErrorKind::QuotaExceeded, "No provider has available quota")
-                } else {
-                    ProxyError::new(ErrorKind::ModelNotFound, "Unknown model")
-                }
-            })
+        selected.map(|(index, _)| index).ok_or_else(|| {
+            if model_exists {
+                ProxyError::new(ErrorKind::QuotaExceeded, "No provider has available quota")
+            } else {
+                ProxyError::new(ErrorKind::ModelNotFound, "Unknown model")
+            }
+        })
     }
 }
 
@@ -111,6 +110,7 @@ impl Drop for GatewayStream {
 pub struct Gateway {
     store: PgStore,
     providers: HashMap<String, Arc<dyn Provider>>,
+    provider_ids: Vec<String>,
     policy: Arc<dyn RoutingPolicy>,
     metrics: Arc<Metrics>,
     concurrency: Arc<Semaphore>,
@@ -127,9 +127,12 @@ impl Gateway {
         max_concurrent: usize,
         timeout: Duration,
     ) -> Self {
+        let mut provider_ids: Vec<_> = providers.keys().cloned().collect();
+        provider_ids.sort();
         Self {
             store,
             providers,
+            provider_ids,
             policy,
             metrics,
             concurrency: Arc::new(Semaphore::new(max_concurrent)),
@@ -146,21 +149,17 @@ impl Gateway {
         let permit = self.concurrency.clone().try_acquire_owned().map_err(|_| {
             ProxyError::new(ErrorKind::Unavailable, "Proxy concurrency limit reached")
         })?;
-        let mut ids: Vec<_> = self.providers.keys().cloned().collect();
-        ids.sort();
-        let states = self
-            .store
-            .provider_states(principal.account_id, &ids)
-            .await?;
-        let routes = self
-            .store
-            .provider_routes(principal.account_id, &ids)
-            .await?;
-        let account_usage = self.store.account_usage(principal.account_id).await?;
+        let (states, mut routes, account_usage) = tokio::try_join!(
+            self.store
+                .provider_states(principal.account_id, &self.provider_ids),
+            self.store
+                .provider_routes(principal.account_id, &self.provider_ids),
+            self.store.account_usage(principal.account_id),
+        )?;
         let selected = self
             .policy
             .select(&request, &account_usage, &routes, &states)?;
-        let route = &routes[selected];
+        let route = routes.swap_remove(selected);
         let provider = self
             .providers
             .get(&route.provider_id)
@@ -188,8 +187,8 @@ impl Gateway {
                 deadline_at: created_at + self.timeout,
             })
             .await?;
-        request.model = route.upstream_model.clone();
-        let provider_id = route.provider_id.clone();
+        request.model = route.upstream_model;
+        let provider_id = route.provider_id;
         let store = self.store.clone();
         let metrics = self.metrics.clone();
         let (sender, receiver) = mpsc::channel(16);

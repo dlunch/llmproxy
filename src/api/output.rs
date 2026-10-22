@@ -100,9 +100,11 @@ impl Output {
             .enumerate()
             .map(|(index, _)| self.item(index, item_status))
             .collect();
-        json!({"id":format!("resp_{}",self.id),"object":"response","created_at":self.created,"model":self.model,
+        let mut response = json!({"id":format!("resp_{}",self.id),"object":"response","created_at":self.created,"model":self.model,
             "status":status,"error":null,"incomplete_details":if status == "incomplete" {json!({"reason":"max_output_tokens"})} else {Value::Null},
-            "output":output,"usage":usage_value(self.usage.as_ref(),true),"store":false})
+            "usage":usage_value(self.usage.as_ref(),true),"store":false});
+        response["output"] = Value::Array(output);
+        response
     }
 
     fn chat_message(&self) -> Value {
@@ -121,18 +123,23 @@ impl Output {
                 Item::Search { .. } => {}
             }
         }
-        let mut message = json!({"role":"assistant","content":if text.is_empty() && !calls.is_empty() {Value::Null} else {json!(text)}});
+        let mut message = json!({"role":"assistant"});
+        message["content"] = if text.is_empty() && !calls.is_empty() {
+            Value::Null
+        } else {
+            Value::String(text)
+        };
         if !calls.is_empty() {
-            message["tool_calls"] = json!(calls);
+            message["tool_calls"] = Value::Array(calls);
         }
         if !annotations.is_empty() {
-            message["annotations"] = json!(annotations);
+            message["annotations"] = Value::Array(annotations);
         }
         message
     }
 
-    // Returns Responses events; collected responses reuse the same normalized output assembly.
-    fn apply(&mut self, event: ProviderEvent) -> Result<Vec<Value>, ProxyError> {
+    // Only Responses streaming needs per-delta events; other paths reuse assembly and validation.
+    fn apply(&mut self, event: ProviderEvent, emit_events: bool) -> Result<Vec<Value>, ProxyError> {
         let mut events = Vec::new();
         match event {
             ProviderEvent::TextDelta(_) | ProviderEvent::Citation { .. }
@@ -144,14 +151,16 @@ impl Output {
                     annotations: Vec::new(),
                 });
                 self.message = Some(index);
-                let mut item = self.item(index, "in_progress");
-                item["content"] = json!([]);
-                events.push(
-                    json!({"type":"response.output_item.added","output_index":index,"item":item}),
-                );
-                events.push(json!({"type":"response.content_part.added","output_index":index,"item_id":format!("msg_{}_{}",self.id,index),"content_index":0,
-                    "part":{"type":"output_text","text":"","annotations":[]}}));
-                events.extend(self.apply(event)?);
+                if emit_events {
+                    let mut item = self.item(index, "in_progress");
+                    item["content"] = json!([]);
+                    events.push(
+                        json!({"type":"response.output_item.added","output_index":index,"item":item}),
+                    );
+                    events.push(json!({"type":"response.content_part.added","output_index":index,"item_id":format!("msg_{}_{}",self.id,index),"content_index":0,
+                        "part":{"type":"output_text","text":"","annotations":[]}}));
+                }
+                events.extend(self.apply(event, emit_events)?);
             }
             ProviderEvent::TextDelta(delta) => {
                 let index = self.message.expect("text message was initialized");
@@ -159,7 +168,11 @@ impl Output {
                     unreachable!()
                 };
                 text.push_str(&delta);
-                events.push(json!({"type":"response.output_text.delta","output_index":index,"item_id":format!("msg_{}_{}",self.id,index),"content_index":0,"delta":delta,"logprobs":[]}));
+                if emit_events {
+                    let mut event = json!({"type":"response.output_text.delta","output_index":index,"item_id":format!("msg_{}_{}",self.id,index),"content_index":0,"logprobs":[]});
+                    event["delta"] = Value::String(delta);
+                    events.push(event);
+                }
             }
             ProviderEvent::Citation {
                 url,
@@ -172,38 +185,36 @@ impl Output {
                     unreachable!()
                 };
                 let citation = json!({"type":"url_citation","url":url,"title":title,"start_index":start_index,"end_index":end_index});
-                events.push(json!({"type":"response.output_text.annotation.added","output_index":index,"item_id":format!("msg_{}_{}",self.id,index),"content_index":0,"annotation_index":annotations.len(),"annotation":citation}));
+                if emit_events {
+                    events.push(json!({"type":"response.output_text.annotation.added","output_index":index,"item_id":format!("msg_{}_{}",self.id,index),"content_index":0,"annotation_index":annotations.len(),"annotation":citation}));
+                }
                 annotations.push(citation);
             }
             ProviderEvent::ToolCallDelta {
                 index: call_index,
-                id,
-                name,
+                mut id,
+                mut name,
                 arguments,
             } => {
                 let index = if let Some(index) = self.calls.get(&call_index) {
                     *index
                 } else {
-                    let id = id.as_ref().filter(|id| !id.is_empty()).ok_or_else(|| {
+                    let id = id.take().filter(|id| !id.is_empty()).ok_or_else(|| {
                         ProxyError::new(ErrorKind::Upstream, "Function call started without an ID")
                     })?;
-                    let name = name
-                        .as_ref()
-                        .filter(|name| !name.is_empty())
-                        .ok_or_else(|| {
-                            ProxyError::new(
-                                ErrorKind::Upstream,
-                                "Function call started without a name",
-                            )
-                        })?;
+                    let name = name.take().filter(|name| !name.is_empty()).ok_or_else(|| {
+                        ProxyError::new(ErrorKind::Upstream, "Function call started without a name")
+                    })?;
                     let index = self.items.len();
                     self.items.push(Item::Function {
-                        id: id.clone(),
-                        name: name.clone(),
+                        id,
+                        name,
                         arguments: String::new(),
                     });
                     self.calls.insert(call_index, index);
-                    events.push(json!({"type":"response.output_item.added","output_index":index,"item":self.item(index,"in_progress")}));
+                    if emit_events {
+                        events.push(json!({"type":"response.output_item.added","output_index":index,"item":self.item(index,"in_progress")}));
+                    }
                     index
                 };
                 let Item::Function {
@@ -223,22 +234,30 @@ impl Output {
                     ));
                 }
                 value.push_str(&arguments);
-                if !arguments.is_empty() {
-                    events.push(json!({"type":"response.function_call_arguments.delta","output_index":index,"item_id":format!("fc_{}_{}",self.id,index),"delta":arguments}));
+                if emit_events && !arguments.is_empty() {
+                    let mut event = json!({"type":"response.function_call_arguments.delta","output_index":index,"item_id":format!("fc_{}_{}",self.id,index)});
+                    event["delta"] = Value::String(arguments);
+                    events.push(event);
                 }
             }
-            ProviderEvent::WebSearch { id, query, status } => {
+            ProviderEvent::WebSearch {
+                id,
+                mut query,
+                status,
+            } => {
                 let index = if let Some(index) = self.searches.get(&id) {
                     *index
                 } else {
                     let index = self.items.len();
                     self.items.push(Item::Search {
                         id: id.clone(),
-                        query: query.clone(),
+                        query: query.take(),
                         status: "in_progress",
                     });
                     self.searches.insert(id.clone(), index);
-                    events.push(json!({"type":"response.output_item.added","output_index":index,"item":self.item(index,"in_progress")}));
+                    if emit_events {
+                        events.push(json!({"type":"response.output_item.added","output_index":index,"item":self.item(index,"in_progress")}));
+                    }
                     index
                 };
                 let status = match status {
@@ -258,7 +277,9 @@ impl Output {
                 if query.is_some() {
                     *previous_query = query;
                 }
-                events.push(json!({"type":format!("response.web_search_call.{status}"),"output_index":index,"item_id":id}));
+                if emit_events {
+                    events.push(json!({"type":format!("response.web_search_call.{status}"),"output_index":index,"item_id":id}));
+                }
             }
             ProviderEvent::Usage(usage) => self.usage = Some(usage),
             ProviderEvent::Finished(_) => {
@@ -277,16 +298,18 @@ impl Output {
         let mut events = Vec::new();
         for (index, item) in self.items.iter().enumerate() {
             match item {
-                Item::Message { text, .. } => {
+                Item::Message { text, annotations } => {
                     events.push(json!({"type":"response.output_text.done","output_index":index,"item_id":format!("msg_{}_{}",self.id,index),"content_index":0,"text":text,"logprobs":[]}));
-                    events.push(json!({"type":"response.content_part.done","output_index":index,"item_id":format!("msg_{}_{}",self.id,index),"content_index":0,"part":self.item(index,status)["content"][0]}));
+                    events.push(json!({"type":"response.content_part.done","output_index":index,"item_id":format!("msg_{}_{}",self.id,index),"content_index":0,"part":{"type":"output_text","text":text,"annotations":annotations}}));
                 }
                 Item::Function { name, arguments, .. } => events.push(json!({"type":"response.function_call_arguments.done","output_index":index,"item_id":format!("fc_{}_{}",self.id,index),"name":name,"arguments":arguments})),
                 Item::Search { .. } => {}
             }
             events.push(json!({"type":"response.output_item.done","output_index":index,"item":self.item(index,status)}));
         }
-        events.push(json!({"type":format!("response.{status}"),"response":self.response(status)}));
+        let mut completed = json!({"type":format!("response.{status}")});
+        completed["response"] = self.response(status);
+        events.push(completed);
         events
     }
 }
@@ -326,7 +349,8 @@ pub(super) async fn collect(
                         FinishReason::ToolCalls => "tool_calls",
                     };
                     let mut value = json!({"id":format!("chatcmpl_{}",output.id),"object":"chat.completion","created":output.created,"model":output.model,
-                        "choices":[{"index":0,"message":output.chat_message(),"finish_reason":finish}]});
+                        "choices":[{"index":0,"finish_reason":finish}]});
+                    value["choices"][0]["message"] = output.chat_message();
                     if output.usage.is_some() {
                         value["usage"] = usage_value(output.usage.as_ref(), false);
                     }
@@ -336,7 +360,7 @@ pub(super) async fn collect(
                 return Ok(Json(response).into_response());
             }
             event => {
-                output.apply(event)?;
+                output.apply(event, false)?;
             }
         }
     }
@@ -383,17 +407,18 @@ pub(super) async fn chat_stream(
                 }
                 ProviderEvent::Citation { url,title,start_index,end_index } => (json!({"annotations":[{"type":"url_citation","url_citation":{"url":url,"title":title,"start_index":start_index,"end_index":end_index}}]}),Value::Null),
                 ProviderEvent::Finished(reason) => (json!({}),json!(match reason { FinishReason::Stop => "stop", FinishReason::Length => "length", FinishReason::ToolCalls => "tool_calls" })),
-                ProviderEvent::Usage(_) | ProviderEvent::WebSearch { .. } => {
-                    if let Err(error) = output.apply(event) {
+                ProviderEvent::Usage(_) => {
+                    if let Err(error) = output.apply(event, false) {
                         yield output.sse(json!({"error":{"message":error.message,"type":error.kind.as_str()}}).to_string(),None);
                         return;
                     }
                     continue;
                 }
+                ProviderEvent::WebSearch { .. } => continue,
             };
             let terminal = !finish.is_null();
-            if !terminal {
-                match output.apply(event) {
+            if matches!(event, ProviderEvent::ToolCallDelta { .. }) {
+                match output.apply(event, false) {
                     Ok(_) => {},
                     Err(error) => {
                         yield output.sse(json!({"error":{"message":error.message,"type":error.kind.as_str()}}).to_string(),None);
@@ -402,7 +427,8 @@ pub(super) async fn chat_stream(
                 }
             }
             let mut chunk = json!({"id":format!("chatcmpl_{}",output.id),"object":"chat.completion.chunk","created":output.created,"model":output.model,
-                "choices":[{"index":0,"delta":delta,"finish_reason":finish}]});
+                "choices":[{"index":0,"finish_reason":finish}]});
+            chunk["choices"][0]["delta"] = delta;
             if include_usage { chunk["usage"] = Value::Null; }
             yield output.sse(chunk.to_string(),None);
             if terminal {
@@ -451,7 +477,7 @@ pub(super) async fn responses_stream(
                     for event in output.completed_events(&reason) { yield response_event(event,&mut sequence,&output); }
                     return;
                 }
-                Ok(event) => output.apply(event),
+                Ok(event) => output.apply(event, true),
                 Err(error) => Err(error),
             };
             match events {

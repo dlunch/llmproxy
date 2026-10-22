@@ -209,10 +209,18 @@ helm lint charts/llmproxy --set database.existingSecret=llmproxy-database
 python3 tests/helm_chart.py
 # Use a disposable PostgreSQL database; tests isolate their tables in random schemas.
 export TEST_DATABASE_URL=postgres://user:password@127.0.0.1:5432/llmproxy_test
-cargo test --locked -- --include-ignored --skip actual_cli_roundtrips
+cargo test --locked -- --include-ignored --skip actual_cli_roundtrips --skip proxy_latency_benchmark
 # Optional: exercise the actual Claude executable against a fake local API.
 CLAUDE_TEST_EXECUTABLE=/absolute/path/to/claude \
   cargo test --locked --test claude_provider actual_cli_roundtrips -- --ignored
 ```
 
 Subprocess fixtures require Python 3. Chart checks require Helm, Python 3.11+, and PyYAML. Database-dependent tests are explicitly ignored unless selected. The actual-Claude test requires both `TEST_DATABASE_URL` and `CLAUDE_TEST_EXECUTABLE`; it runs the executable against a fake local API and does not contact a real subscription account. Other provider tests use local HTTP/subprocess fixtures. See the QA report for the actual checks performed and account-dependent limitations. Replicas must use the same provider ID for a shared upstream credential so that PostgreSQL credential locks coordinate them.
+
+Run the request-path latency benchmark separately with a disposable `TEST_DATABASE_URL`:
+
+```sh
+cargo test --release --locked --test api_integration proxy_latency_benchmark -- --ignored --nocapture
+```
+
+It measures first-frame and complete-response latency for both APIs, with 128 KiB of input, 2,048 synthetic output deltas, and one or four concurrent requests. It includes PostgreSQL and in-process API handling; it excludes live upstream latency, network transport to the client, and production logging sinks.
