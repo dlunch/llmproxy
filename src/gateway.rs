@@ -203,19 +203,22 @@ impl Gateway {
             let mut output_bytes = 0usize;
             let mut first_text = false;
             let result = async {
+                let cancelled = task_cancellation.cancelled();
+                let timed_out = tokio::time::sleep_until(deadline);
+                tokio::pin!(cancelled, timed_out);
                 let preparation_timer = metrics.time_stage(Stage::ProviderSetup);
                 let mut stream = tokio::select! {
                     biased;
-                    _ = task_cancellation.cancelled() => return Err(ProxyError::new(ErrorKind::Cancelled, "Request cancelled")),
-                    _ = tokio::time::sleep_until(deadline) => return Err(ProxyError::new(ErrorKind::Timeout, "Request timed out")),
+                    _ = &mut cancelled => return Err(ProxyError::new(ErrorKind::Cancelled, "Request cancelled")),
+                    _ = &mut timed_out => return Err(ProxyError::new(ErrorKind::Timeout, "Request timed out")),
                     result = provider.infer(request, task_cancellation.clone()) => result?,
                 };
                 drop(preparation_timer);
                 loop {
                     let event = tokio::select! {
                         biased;
-                        _ = task_cancellation.cancelled() => return Err(ProxyError::new(ErrorKind::Cancelled, "Request cancelled")),
-                        _ = tokio::time::sleep_until(deadline) => return Err(ProxyError::new(ErrorKind::Timeout, "Request timed out")),
+                        _ = &mut cancelled => return Err(ProxyError::new(ErrorKind::Cancelled, "Request cancelled")),
+                        _ = &mut timed_out => return Err(ProxyError::new(ErrorKind::Timeout, "Request timed out")),
                         event = stream.next() => event.ok_or_else(|| ProxyError::new(ErrorKind::Upstream, "Upstream ended before completion"))??,
                     };
                     match &event {
@@ -251,8 +254,8 @@ impl Gateway {
                     }
                     tokio::select! {
                         biased;
-                        _ = task_cancellation.cancelled() => return Err(ProxyError::new(ErrorKind::Cancelled, "Request cancelled")),
-                        _ = tokio::time::sleep_until(deadline) => return Err(ProxyError::new(ErrorKind::Timeout, "Request timed out")),
+                        _ = &mut cancelled => return Err(ProxyError::new(ErrorKind::Cancelled, "Request cancelled")),
+                        _ = &mut timed_out => return Err(ProxyError::new(ErrorKind::Timeout, "Request timed out")),
                         sent = sender.send(Ok(event)) => {
                             if sent.is_err() { return Err(ProxyError::new(ErrorKind::Cancelled, "Request cancelled")); }
                         }

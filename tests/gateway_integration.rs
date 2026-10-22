@@ -398,6 +398,23 @@ async fn postgres_gateway_lifecycle_routing_and_cancellation() {
         .unwrap();
     assert_eq!(states.len(), 2);
     assert_eq!(states.iter().map(|s| s.accumulated_tokens).sum::<u64>(), 35);
+    assert_eq!(
+        states
+            .iter()
+            .find(|s| s.provider_id == a)
+            .unwrap()
+            .quota
+            .len(),
+        2
+    );
+    assert!(
+        states
+            .iter()
+            .find(|s| s.provider_id == b)
+            .unwrap()
+            .quota
+            .is_empty()
+    );
     let mut unknown = request("hello");
     unknown.model = "unknown".into();
     assert!(matches!(
@@ -604,6 +621,29 @@ async fn postgres_gateway_lifecycle_routing_and_cancellation() {
     }
     let usage = store.account_usage(account_id).await.unwrap();
     assert_eq!(usage.input_tokens + usage.output_tokens, 47);
+    let mut timed_with_usage = gateway
+        .execute(
+            principal(),
+            request("usage-then-wait"),
+            std::time::Instant::now(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        timed_with_usage.next().await.unwrap().unwrap(),
+        ProviderEvent::Usage(_)
+    ));
+    assert!(matches!(
+        timed_with_usage.next().await.unwrap().err().unwrap().kind,
+        llmproxy::core::ErrorKind::Timeout
+    ));
+    let row: (String, Option<i64>, Option<i64>) =
+        sqlx::query_as("SELECT outcome,input_tokens,output_tokens FROM requests WHERE id=$1")
+            .bind(timed_with_usage.request_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(row, ("timed_out".into(), Some(1), Some(1)));
     let mut cancelled_with_usage = gateway
         .execute(
             principal(),
@@ -626,7 +666,7 @@ async fn postgres_gateway_lifecycle_routing_and_cancellation() {
         .unwrap();
     assert_eq!(outcome, "cancelled");
     let usage = store.account_usage(account_id).await.unwrap();
-    assert_eq!(usage.input_tokens + usage.output_tokens, 49);
+    assert_eq!(usage.input_tokens + usage.output_tokens, 51);
     let totals_match: bool = sqlx::query_scalar("SELECT p.input_tokens=COALESCE(sum(r.input_tokens),0) AND p.output_tokens=COALESCE(sum(r.output_tokens),0) FROM provider_instances p LEFT JOIN requests r ON r.provider_id=p.id WHERE p.id=$1 GROUP BY p.id")
         .bind(&b).fetch_one(&pool).await.unwrap();
     assert!(totals_match);

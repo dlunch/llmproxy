@@ -167,28 +167,32 @@ impl PgStore {
         account_id: Uuid,
         provider_ids: &[String],
     ) -> Result<Vec<ProviderState>, ProxyError> {
-        let usage: Vec<(String, i64)> = sqlx::query_as("SELECT id,input_tokens + output_tokens FROM provider_instances WHERE account_id=$1 AND id=ANY($2)")
+        let rows = sqlx::query("SELECT p.id,p.input_tokens + p.output_tokens AS accumulated_tokens,q.window_key,q.observed_at,q.remaining_fraction,q.resets_at FROM provider_instances p LEFT JOIN provider_quota q ON q.provider_id=p.id WHERE p.account_id=$1 AND p.id=ANY($2) ORDER BY p.id")
             .bind(account_id).bind(provider_ids).fetch_all(&self.pool).await?;
-        let eligible_ids: Vec<_> = usage.iter().map(|(id, _)| id.as_str()).collect();
-        let quotas = sqlx::query("SELECT provider_id,window_key,observed_at,remaining_fraction,resets_at FROM provider_quota WHERE provider_id=ANY($1)")
-            .bind(&eligible_ids).fetch_all(&self.pool).await?;
-        let mut states: Vec<_> = usage
-            .into_iter()
-            .map(|(provider_id, tokens)| ProviderState {
-                provider_id,
-                accumulated_tokens: tokens as u64,
-                quota: vec![],
-            })
-            .collect();
-        for row in quotas {
-            let provider: String = row.try_get("provider_id")?;
-            if let Some(state) = states.iter_mut().find(|s| s.provider_id == provider) {
-                state.quota.push(QuotaWindow {
-                    key: row.try_get("window_key")?,
-                    observed_at: row.try_get("observed_at")?,
-                    remaining_fraction: row.try_get("remaining_fraction")?,
-                    resets_at: row.try_get("resets_at")?,
+        let mut states = Vec::<ProviderState>::new();
+        for row in rows {
+            let provider: &str = row.try_get("id")?;
+            if states
+                .last()
+                .is_none_or(|state| state.provider_id != provider)
+            {
+                states.push(ProviderState {
+                    provider_id: provider.to_owned(),
+                    accumulated_tokens: row.try_get::<i64, _>("accumulated_tokens")? as u64,
+                    quota: Vec::new(),
                 });
+            }
+            if let Some(key) = row.try_get::<Option<String>, _>("window_key")? {
+                states
+                    .last_mut()
+                    .expect("provider row was initialized")
+                    .quota
+                    .push(QuotaWindow {
+                        key,
+                        observed_at: row.try_get("observed_at")?,
+                        remaining_fraction: row.try_get("remaining_fraction")?,
+                        resets_at: row.try_get("resets_at")?,
+                    });
             }
         }
         Ok(states)
