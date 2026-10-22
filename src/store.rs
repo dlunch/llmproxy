@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use sqlx::{PgPool, Postgres, Row, Transaction};
+use sqlx::{PgPool, Postgres, QueryBuilder, Row, Transaction};
 use uuid::Uuid;
 
 use crate::core::{AccountUsage, Credential, ErrorKind, Principal, ProxyError, Usage};
@@ -93,8 +93,11 @@ impl PgStore {
     }
 
     pub async fn account_usage(&self, account_id: Uuid) -> Result<AccountUsage, ProxyError> {
-        let (input, output): (i64, i64) = sqlx::query_as("SELECT COALESCE(SUM(input_tokens),0)::bigint,COALESCE(SUM(output_tokens),0)::bigint FROM requests WHERE account_id=$1")
-            .bind(account_id).fetch_one(&self.pool).await?;
+        let (input, output): (i64, i64) =
+            sqlx::query_as("SELECT input_tokens,output_tokens FROM accounts WHERE id=$1")
+                .bind(account_id)
+                .fetch_one(&self.pool)
+                .await?;
         Ok(AccountUsage {
             account_id,
             input_tokens: input as u64,
@@ -164,7 +167,7 @@ impl PgStore {
         account_id: Uuid,
         provider_ids: &[String],
     ) -> Result<Vec<ProviderState>, ProxyError> {
-        let usage: Vec<(String, i64)> = sqlx::query_as("SELECT p.id, COALESCE(SUM(COALESCE(r.input_tokens,0)::numeric + COALESCE(r.output_tokens,0)::numeric),0)::bigint FROM provider_instances p LEFT JOIN requests r ON r.provider_id=p.id AND r.account_id=p.account_id WHERE p.account_id=$1 AND p.id=ANY($2) GROUP BY p.id")
+        let usage: Vec<(String, i64)> = sqlx::query_as("SELECT id,input_tokens + output_tokens FROM provider_instances WHERE account_id=$1 AND id=ANY($2)")
             .bind(account_id).bind(provider_ids).fetch_all(&self.pool).await?;
         let eligible_ids: Vec<_> = usage.iter().map(|(id, _)| id.as_str()).collect();
         let quotas = sqlx::query("SELECT provider_id,window_key,observed_at,remaining_fraction,resets_at FROM provider_quota WHERE provider_id=ANY($1)")
@@ -189,6 +192,15 @@ impl PgStore {
             }
         }
         Ok(states)
+    }
+
+    pub async fn codex_credentials(
+        &self,
+        provider_id: &str,
+    ) -> Result<CodexCredentials, ProxyError> {
+        sqlx::query_as("SELECT access_token,refresh_token,account_id,expires_at,updated_at FROM provider_credentials WHERE provider_id=$1")
+            .bind(provider_id).fetch_optional(&self.pool).await?
+            .ok_or_else(|| ProxyError::new(ErrorKind::UpstreamAuth, "Codex credentials unavailable"))
     }
 
     pub async fn lock_codex_credentials(
@@ -222,6 +234,15 @@ impl PgStore {
             .bind(&credentials.account_id).bind(credentials.expires_at).execute(&mut *transaction).await?;
         transaction.commit().await?;
         Ok(())
+    }
+
+    pub async fn claude_credentials(
+        &self,
+        provider_id: &str,
+    ) -> Result<ClaudeCredentials, ProxyError> {
+        sqlx::query_as("SELECT credentials,oauth_account,user_id,has_completed_onboarding,updated_at FROM claude_credentials WHERE provider_id=$1")
+            .bind(provider_id).fetch_optional(&self.pool).await?
+            .ok_or_else(|| ProxyError::new(ErrorKind::UpstreamAuth, "Claude subscription credentials are not configured"))
     }
 
     pub async fn lock_claude_credentials(
@@ -262,13 +283,23 @@ impl PgStore {
         provider_id: &str,
         windows: &[QuotaWindow],
     ) -> Result<(), ProxyError> {
-        let mut transaction = self.pool.begin().await?;
-        for window in windows {
-            sqlx::query("INSERT INTO provider_quota(provider_id,window_key,observed_at,remaining_fraction,resets_at) VALUES ($1,$2,$3,$4,$5) ON CONFLICT(provider_id,window_key) DO UPDATE SET observed_at=EXCLUDED.observed_at,remaining_fraction=EXCLUDED.remaining_fraction,resets_at=EXCLUDED.resets_at WHERE provider_quota.observed_at <= EXCLUDED.observed_at")
-                .bind(provider_id).bind(&window.key).bind(window.observed_at)
-                .bind(window.remaining_fraction).bind(window.resets_at).execute(&mut *transaction).await?;
+        if windows.is_empty() {
+            return Ok(());
         }
-        transaction.commit().await?;
+        let mut query = QueryBuilder::<Postgres>::new(
+            "INSERT INTO provider_quota(provider_id,window_key,observed_at,remaining_fraction,resets_at) ",
+        );
+        let mut ordered: Vec<_> = windows.iter().collect();
+        ordered.sort_unstable_by(|left, right| left.key.cmp(&right.key));
+        query.push_values(ordered, |mut row, window| {
+            row.push_bind(provider_id)
+                .push_bind(&window.key)
+                .push_bind(window.observed_at)
+                .push_bind(window.remaining_fraction)
+                .push_bind(window.resets_at);
+        });
+        query.push(" ON CONFLICT(provider_id,window_key) DO UPDATE SET observed_at=EXCLUDED.observed_at,remaining_fraction=EXCLUDED.remaining_fraction,resets_at=EXCLUDED.resets_at WHERE provider_quota.observed_at <= EXCLUDED.observed_at");
+        query.build().execute(&self.pool).await?;
         Ok(())
     }
 

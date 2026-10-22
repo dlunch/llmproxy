@@ -1,6 +1,7 @@
 use std::{
     net::{IpAddr, SocketAddr},
     sync::Arc,
+    time::Instant,
 };
 
 mod output;
@@ -23,7 +24,7 @@ use crate::{
         Tool, ToolCall, ToolChoice,
     },
     gateway::Gateway,
-    metrics::Metrics,
+    metrics::{Metrics, Stage},
     store::PgStore,
 };
 
@@ -470,6 +471,7 @@ async fn authenticate(
     headers: &HeaderMap,
     peer: Option<IpAddr>,
 ) -> Result<Principal, ProxyError> {
+    let _timer = state.metrics.time_stage(Stage::Authentication);
     if !headers.contains_key("authorization") {
         if let Some(ip) = peer.map(|ip| ip.to_canonical())
             && let Some(principal) = state.store.authenticate_ip(ip).await?
@@ -502,6 +504,7 @@ async fn chat(
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Result<Response, ProxyError> {
+    let started = Instant::now();
     let principal = authenticate(
         &state,
         &headers,
@@ -550,7 +553,7 @@ async fn chat(
     };
     validate(&request)?;
     let account_id = principal.account_id;
-    let stream = state.gateway.execute(principal, request).await?;
+    let stream = state.gateway.execute(principal, request, started).await?;
     let request_id = stream.request_id;
     tracing::info!(event = "api_request", %request_id, %account_id, body_json = %request_body);
     let result = if body.stream {
@@ -574,6 +577,7 @@ async fn responses(
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Result<Response, ProxyError> {
+    let started = Instant::now();
     let principal = authenticate(
         &state,
         &headers,
@@ -620,7 +624,7 @@ async fn responses(
     };
     validate(&request)?;
     let account_id = principal.account_id;
-    let stream = state.gateway.execute(principal, request).await?;
+    let stream = state.gateway.execute(principal, request, started).await?;
     let request_id = stream.request_id;
     tracing::info!(event = "api_request", %request_id, %account_id, body_json = %request_body);
     let result = if body.stream {

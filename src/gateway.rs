@@ -18,7 +18,7 @@ use crate::{
         AccountUsage, Credential, ErrorKind, InferenceRequest, Principal, Provider, ProviderEvent,
         ProxyError, Usage,
     },
-    metrics::Metrics,
+    metrics::{Metrics, Stage},
     store::{NewRequest, PgStore},
 };
 
@@ -145,10 +145,12 @@ impl Gateway {
         &self,
         principal: Principal,
         mut request: InferenceRequest,
+        started: Instant,
     ) -> Result<GatewayStream, ProxyError> {
         let permit = self.concurrency.clone().try_acquire_owned().map_err(|_| {
             ProxyError::new(ErrorKind::Unavailable, "Proxy concurrency limit reached")
         })?;
+        let routing_timer = self.metrics.time_stage(Stage::Routing);
         let (states, mut routes, account_usage) = tokio::try_join!(
             self.store
                 .provider_states(principal.account_id, &self.provider_ids),
@@ -160,6 +162,7 @@ impl Gateway {
             .policy
             .select(&request, &account_usage, &routes, &states)?;
         let route = routes.swap_remove(selected);
+        drop(routing_timer);
         let provider = self
             .providers
             .get(&route.provider_id)
@@ -167,7 +170,6 @@ impl Gateway {
             .clone();
         let created_at = Utc::now();
         let request_id = Uuid::new_v4();
-        let started = Instant::now();
         let deadline = tokio::time::Instant::now() + self.timeout;
         let (token_id, ip_range_id, client_ip) = match principal.credential {
             Credential::ApiToken(id) => (Some(id), None, None),
@@ -199,13 +201,16 @@ impl Gateway {
             let _permit = permit;
             let mut usage = None;
             let mut output_bytes = 0usize;
+            let mut first_text = false;
             let result = async {
+                let preparation_timer = metrics.time_stage(Stage::ProviderSetup);
                 let mut stream = tokio::select! {
                     biased;
                     _ = task_cancellation.cancelled() => return Err(ProxyError::new(ErrorKind::Cancelled, "Request cancelled")),
                     _ = tokio::time::sleep_until(deadline) => return Err(ProxyError::new(ErrorKind::Timeout, "Request timed out")),
                     result = provider.infer(request, task_cancellation.clone()) => result?,
                 };
+                drop(preparation_timer);
                 loop {
                     let event = tokio::select! {
                         biased;
@@ -234,6 +239,10 @@ impl Gateway {
                             output_bytes = output_bytes.saturating_add(url.len()).saturating_add(title.len());
                         }
                         ProviderEvent::TextDelta(text) => {
+                            if !first_text && !text.is_empty() {
+                                metrics.observe_stage(Stage::FirstText, started.elapsed());
+                                first_text = true;
+                            }
                             output_bytes = output_bytes.saturating_add(text.len());
                         }
                     }

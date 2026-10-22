@@ -1,4 +1,4 @@
-use std::{os::unix::fs::PermissionsExt, path::Path, time::Duration};
+use std::{os::unix::fs::PermissionsExt, path::Path, sync::Arc, time::Duration};
 
 use futures_util::StreamExt;
 use llmproxy::{
@@ -22,15 +22,14 @@ def stream(event): emit({'type':'stream_event','event':event})
 def assistant(mid,usage,block): emit({'type':'assistant','message':{'id':mid,'usage':usage,'content':[block]}})
 config=pathlib.Path(os.environ['CLAUDE_CONFIG_DIR'])
 capture=pathlib.Path(__file__).parent
-credentials=json.loads((config/'.credentials.json').read_text())
+assert not (config/'.credentials.json').exists()
+assert os.environ['CLAUDE_CODE_OAUTH_TOKEN']
+assert os.environ['CLAUDE_CODE_ENTRYPOINT']=='local-agent'
+assert os.environ['CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH']=='1'
 assert json.loads((config/'.claude.json').read_text())['oauthAccount']['accountUuid']=='fixture-account'
-if arg('--model')=='serialized': time.sleep(0.1)
-rotation=credentials['rotation']+1
-credentials['rotation']=rotation
-if 'claudeAiOauth' in credentials: credentials['claudeAiOauth']['accessToken']+='-cli'
-(config/'.credentials.json').write_text(json.dumps(credentials))
-# Only login state is persisted; arbitrary CLI state is discarded.
-(config/'.claude.json').write_text(json.dumps({'hasCompletedOnboarding':True,'projects':{'private':'discard'}}))
+if arg('--model')=='concurrent':
+ (capture/f'ready-{os.getpid()}').touch()
+ while len(list(capture.glob('ready-*')))<2: time.sleep(0.01)
 (capture/'pid').write_text(str(os.getpid()))
 assert '--safe-mode' in args and '--no-session-persistence' in args
 assert '--strict-mcp-config' in args and '--disable-slash-commands' in args
@@ -52,8 +51,22 @@ if json.loads(arg('--mcp-config'))['mcpServers']:
   assert reply['type']=='control_response'
   if method=='tools/list': functions=reply['response']['response']['mcp_response']['result']['tools']
 history=[json.loads(line) for line in pathlib.Path(arg('--resume')).read_text().splitlines()] if '--resume' in args else []
-(capture/'capture.json').write_text(json.dumps({'rotation':rotation,'config_dir':str(config),'history':history,'user':user,'functions':functions,'tools':arg('--tools'),'system':pathlib.Path(arg('--system-prompt-file')).read_text()}))
+(capture/'capture.json').write_text(json.dumps({'access_token':os.environ['CLAUDE_CODE_OAUTH_TOKEN'],'config_dir':str(config),'history':history,'user':user,'functions':functions,'tools':arg('--tools'),'system':pathlib.Path(arg('--system-prompt-file')).read_text()}))
 scenario=arg('--model')
+if scenario.startswith('refresh'):
+ if scenario=='refresh-concurrent':
+  (capture/f'auth-ready-{os.getpid()}').touch()
+  while len(list(capture.glob('auth-ready-*')))<2: time.sleep(0.01)
+ if scenario=='refresh-delayed':
+  (capture/'auth-delayed').touch()
+  while not (capture/'auth-release').exists(): time.sleep(0.01)
+ previous=os.environ['CLAUDE_CODE_OAUTH_TOKEN']
+ for attempt in range(2 if scenario=='refresh-twice' else 1):
+  emit({'type':'control_request','request_id':f'refresh-{attempt}','request':{'subtype':'oauth_token_refresh'}})
+  reply=read()
+  assert reply['response']['response']['accessToken']!=previous
+  previous=reply['response']['response']['accessToken']
+  (capture/f'auth-reply-{os.getpid()}-{attempt}').write_text(reply['response']['response']['accessToken'])
 reset=int(time.time())
 if scenario=='quota-invalid':
  emit({'type':'rate_limit_event','rate_limit_info':{'unifiedWindows':{'five_hour':{'utilization':'unknown','resetsAt':reset+3600},'seven_day':{'utilization':0.4,'resetsAt':reset+604800},'unknown':{'utilization':1,'resetsAt':reset+3600}}}})
@@ -106,6 +119,7 @@ async fn fixture() -> (tempfile::TempDir, ClaudeProvider, sqlx::PgPool) {
         script,
         PgStore::new(pool.clone()),
         ClaudeAuth::new(reqwest::Client::new(), "http://127.0.0.1:1/token".into()),
+        Arc::new(llmproxy::metrics::Metrics::default()),
     );
     (dir, provider, pool)
 }
@@ -140,7 +154,7 @@ async fn auth_database() -> sqlx::PgPool {
         .await
         .unwrap();
     sqlx::query("INSERT INTO claude_credentials(provider_id,credentials,oauth_account,user_id) VALUES ('claude-main',$1,$2,'fixture-user')")
-        .bind(json!({"rotation":0})).bind(json!({"accountUuid":"fixture-account"})).execute(&pool).await.unwrap();
+        .bind(json!({"claudeAiOauth":{"accessToken":"fixture-access","refreshToken":"fixture-refresh","scopes":["user:inference"],"subscriptionType":"max","rateLimitTier":"fixture-tier"}})).bind(json!({"accountUuid":"fixture-account"})).execute(&pool).await.unwrap();
     pool
 }
 
@@ -263,24 +277,8 @@ async fn subprocess_requires_successful_result_and_exit() {
             .unwrap();
             assert_eq!(
                 after, original_timestamp,
-                "non-OAuth CLI state must not postpone refresh"
+                "inference must not rewrite host-owned credentials"
             );
-            sqlx::query("UPDATE claude_credentials SET credentials=jsonb_set(credentials,'{claudeAiOauth}', '{\"accessToken\":\"before-cli\"}'),updated_at=now()-interval '2 hours'")
-                .execute(&pool).await.unwrap();
-            let mut refreshed = provider
-                .infer(request("success"), CancellationToken::new())
-                .await
-                .unwrap();
-            while let Some(event) = refreshed.next().await {
-                event.unwrap();
-            }
-            let after_rotation: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
-                "SELECT updated_at FROM claude_credentials WHERE provider_id='claude-main'",
-            )
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-            assert!(after_rotation >= original_timestamp);
         } else {
             assert!(!finished, "{scenario} incorrectly completed");
             assert!(failed, "{scenario} did not fail");
@@ -378,7 +376,10 @@ async fn parallel_function_handoff_preserves_calls_and_cumulative_search_usage()
     assert_process_terminated(dir.path()).await;
     let saved = sqlx::query_as::<_, ClaudeCredentials>("SELECT credentials,oauth_account,user_id,has_completed_onboarding,updated_at FROM claude_credentials WHERE provider_id='claude-main'")
         .fetch_one(&pool).await.unwrap();
-    assert_eq!(saved.credentials["rotation"], 1);
+    assert_eq!(
+        saved.credentials["claudeAiOauth"]["accessToken"],
+        "fixture-access"
+    );
     assert_eq!(
         saved.oauth_account.unwrap()["accountUuid"],
         "fixture-account"
@@ -476,7 +477,10 @@ async fn cancellation_and_dropped_stream_terminate_the_subprocess() {
         assert_process_terminated(dir.path()).await;
         let saved = sqlx::query_as::<_, ClaudeCredentials>("SELECT credentials,oauth_account,user_id,has_completed_onboarding,updated_at FROM claude_credentials WHERE provider_id='claude-main'")
         .fetch_one(&pool).await.unwrap();
-        assert_eq!(saved.credentials["rotation"], 1);
+        assert_eq!(
+            saved.credentials["claudeAiOauth"]["accessToken"],
+            "fixture-access"
+        );
         if mode != "never-polled" {
             assert_eq!(
                 sqlx::query_scalar::<_, i64>("SELECT count(*) FROM provider_quota")
@@ -497,9 +501,24 @@ async fn actual_cli_roundtrips_parallel_calls_against_a_local_messages_api() {
     let executable =
         std::env::var("CLAUDE_TEST_EXECUTABLE").expect("CLAUDE_TEST_EXECUTABLE is required");
     let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let refreshes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = refreshes.clone();
     let app = Router::new()
         .route("/v1/messages/count_tokens",post(|| async { Json(json!({"input_tokens":10})) }))
-        .route("/v1/messages",post(|State(captured):State<Arc<Mutex<Vec<Value>>>>,Json(body):Json<Value>| async move {
+        .route("/oauth/token",post(move |Json(body):Json<Value>| {
+            let counter = counter.clone();
+            async move {
+                assert_eq!(body["refresh_token"], "fixture-refresh");
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Json(json!({"access_token":"official-renewed","refresh_token":"official-rotated","expires_in":3600}))
+            }
+        }))
+        .route("/v1/messages",post(|State(captured):State<Arc<Mutex<Vec<Value>>>>,headers:axum::http::HeaderMap,Json(body):Json<Value>| async move {
+            if headers["authorization"] == "Bearer fixture-access" {
+                return axum::response::Response::builder().status(401).header("content-type","application/json")
+                    .body(axum::body::Body::from(r#"{"type":"error","error":{"type":"authentication_error","message":"OAuth token has expired"}}"#)).unwrap();
+            }
+            assert_eq!(headers["authorization"], "Bearer official-renewed");
             captured.lock().unwrap().push(body.clone());
             let resumed = body["messages"].as_array().unwrap().iter().any(|message| {
                 message["content"].as_array().is_some_and(|blocks| blocks.iter().any(|block| block["type"]=="tool_result"))
@@ -540,14 +559,18 @@ async fn actual_cli_roundtrips_parallel_calls_against_a_local_messages_api() {
     let dir = tempfile::tempdir().unwrap();
     let wrapper = dir.path().join("claude-wrapper");
     let executable_json = serde_json::to_string(&executable).unwrap();
-    std::fs::write(&wrapper,format!("#!/usr/bin/env python3\nimport os,sys\nos.environ['CLAUDE_CODE_OAUTH_TOKEN']='local-fixture-not-a-real-token'\nos.environ['ANTHROPIC_BASE_URL']='http://{address}'\nos.execv({executable_json},[{executable_json}]+sys.argv[1:])\n")).unwrap();
+    std::fs::write(&wrapper,format!("#!/usr/bin/env python3\nimport os,sys\nos.environ['ANTHROPIC_BASE_URL']='http://{address}'\nos.execv({executable_json},[{executable_json}]+sys.argv[1:])\n")).unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
     let pool = auth_database().await;
     let provider = ClaudeProvider::new(
         "claude-main".into(),
         wrapper,
         PgStore::new(pool.clone()),
-        ClaudeAuth::new(reqwest::Client::new(), "http://127.0.0.1:1/token".into()),
+        ClaudeAuth::new(
+            reqwest::Client::new(),
+            format!("http://{address}/oauth/token"),
+        ),
+        Arc::new(llmproxy::metrics::Metrics::default()),
     );
     let mut initial = request("claude-sonnet-4-6");
     initial.tools = vec![function()];
@@ -630,48 +653,61 @@ async fn actual_cli_roundtrips_parallel_calls_against_a_local_messages_api() {
             ("claude_seven_day".into(), 0.6)
         ]
     );
-    let requests = captured.lock().unwrap();
-    let last = requests.last().unwrap();
-    let messages = last["messages"].as_array().unwrap();
-    assert!(messages.iter().any(|message| message["role"] == "assistant"
-        && message["content"].as_array().is_some_and(|blocks| {
-            blocks
+    {
+        let requests = captured.lock().unwrap();
+        let last = requests.last().unwrap();
+        let messages = last["messages"].as_array().unwrap();
+        assert!(messages.iter().any(|message| message["role"] == "assistant"
+            && message["content"].as_array().is_some_and(|blocks| {
+                blocks
+                    .iter()
+                    .filter(|block| block["type"] == "tool_use")
+                    .count()
+                    == 2
+            })));
+        assert_eq!(
+            messages.len(),
+            3,
+            "CLI inserted an unexpected conversation turn"
+        );
+        assert_eq!(messages[2]["role"], "user");
+        let results = messages[2]["content"].as_array().unwrap();
+        for (id, expected) in [("toolu_seoul", "sunny"), ("toolu_busan", "cloudy")] {
+            let result = results
                 .iter()
-                .filter(|block| block["type"] == "tool_use")
-                .count()
-                == 2
-        })));
-    assert_eq!(
-        messages.len(),
-        3,
-        "CLI inserted an unexpected conversation turn"
-    );
-    assert_eq!(messages[2]["role"], "user");
-    let results = messages[2]["content"].as_array().unwrap();
-    for (id, expected) in [("toolu_seoul", "sunny"), ("toolu_busan", "cloudy")] {
-        let result = results
-            .iter()
-            .find(|block| block["tool_use_id"] == id)
-            .expect("client result was lost");
-        assert_eq!(result["type"], "tool_result");
-        assert!(result.get("is_error").is_none());
-        let content = result["content"].as_array().unwrap();
-        let text = content[0]["text"].as_str().unwrap();
-        // Native resume separates environment reminders with one trailing newline.
-        assert_eq!(text.strip_suffix('\n').unwrap_or(text), expected);
-        assert!(content[1..].iter().all(|block| {
-            block["text"]
-                .as_str()
-                .unwrap()
-                .starts_with("<system-reminder>")
-        }));
+                .find(|block| block["tool_use_id"] == id)
+                .expect("client result was lost");
+            assert_eq!(result["type"], "tool_result");
+            assert!(result.get("is_error").is_none());
+            let content = result["content"].as_array().unwrap();
+            let text = content[0]["text"].as_str().unwrap();
+            // Native resume separates environment reminders with one trailing newline.
+            assert_eq!(text.strip_suffix('\n').unwrap_or(text), expected);
+            assert!(content[1..].iter().all(|block| {
+                block["text"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("<system-reminder>")
+            }));
+        }
     }
+    assert_eq!(refreshes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let persisted: Value = sqlx::query_scalar(
+        "SELECT credentials FROM claude_credentials WHERE provider_id='claude-main'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        persisted["claudeAiOauth"]["refreshToken"],
+        "official-rotated"
+    );
     server.abort();
 }
 
 #[tokio::test]
 #[ignore = "requires TEST_DATABASE_URL PostgreSQL"]
-async fn concurrent_calls_reload_rotated_credentials_and_persistence_errors_fail_requests() {
+async fn concurrent_calls_share_credentials_and_persist_quota_independently() {
     let (dir, provider, pool) = fixture().await;
     let second_pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
@@ -683,10 +719,11 @@ async fn concurrent_calls_reload_rotated_credentials_and_persistence_errors_fail
         dir.path().join("claude"),
         PgStore::new(second_pool),
         ClaudeAuth::new(reqwest::Client::new(), "http://127.0.0.1:1/token".into()),
+        Arc::new(llmproxy::metrics::Metrics::default()),
     );
     let first = async {
         let mut stream = provider
-            .infer(request("serialized"), CancellationToken::new())
+            .infer(request("concurrent"), CancellationToken::new())
             .await
             .unwrap();
         while let Some(event) = stream.next().await {
@@ -695,7 +732,7 @@ async fn concurrent_calls_reload_rotated_credentials_and_persistence_errors_fail
     };
     let second = async {
         let mut stream = second_provider
-            .infer(request("serialized"), CancellationToken::new())
+            .infer(request("concurrent"), CancellationToken::new())
             .await
             .unwrap();
         while let Some(event) = stream.next().await {
@@ -707,16 +744,32 @@ async fn concurrent_calls_reload_rotated_credentials_and_persistence_errors_fail
     })
     .await
     .unwrap();
+    let store = PgStore::new(pool.clone());
+    let (held, _) = store.lock_claude_credentials("claude-main").await.unwrap();
+    let mut unlocked = tokio::time::timeout(
+        Duration::from_secs(1),
+        second_provider.infer(request("success"), CancellationToken::new()),
+    )
+    .await
+    .expect("fresh Claude credentials waited for a row lock")
+    .unwrap();
+    while let Some(event) = unlocked.next().await {
+        event.unwrap();
+    }
+    held.commit().await.unwrap();
     let saved = sqlx::query_as::<_, ClaudeCredentials>("SELECT credentials,oauth_account,user_id,has_completed_onboarding,updated_at FROM claude_credentials WHERE provider_id='claude-main'")
         .fetch_one(&pool).await.unwrap();
-    assert_eq!(saved.credentials["rotation"], 2);
+    assert_eq!(
+        saved.credentials["claudeAiOauth"]["accessToken"],
+        "fixture-access"
+    );
     assert_eq!(
         saved.oauth_account.unwrap()["accountUuid"],
         "fixture-account"
     );
     let capture: Value =
         serde_json::from_slice(&std::fs::read(dir.path().join("capture.json")).unwrap()).unwrap();
-    assert_eq!(capture["rotation"], 2);
+    assert_eq!(capture["access_token"], "fixture-access");
     assert!(!Path::new(capture["config_dir"].as_str().unwrap()).exists());
 
     sqlx::raw_sql("CREATE FUNCTION reject_quota_update() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture rejection'; END $$; CREATE TRIGGER reject_quota_update BEFORE INSERT OR UPDATE ON provider_quota FOR EACH ROW EXECUTE FUNCTION reject_quota_update();")
@@ -749,8 +802,8 @@ async fn concurrent_calls_reload_rotated_credentials_and_persistence_errors_fail
     .await
     .unwrap();
     assert_eq!(
-        rotated["rotation"], 3,
-        "quota failure must not roll back rotated credentials"
+        rotated["claudeAiOauth"]["accessToken"], "fixture-access",
+        "quota failure must not change host-owned credentials"
     );
     sqlx::raw_sql(
         "DROP TRIGGER reject_quota_update ON provider_quota; DROP FUNCTION reject_quota_update();",
@@ -759,30 +812,6 @@ async fn concurrent_calls_reload_rotated_credentials_and_persistence_errors_fail
     .await
     .unwrap();
 
-    sqlx::raw_sql("CREATE FUNCTION reject_auth_update() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture rejection'; END $$; CREATE TRIGGER reject_auth_update BEFORE UPDATE ON claude_credentials FOR EACH ROW EXECUTE FUNCTION reject_auth_update();")
-        .execute(&pool).await.unwrap();
-    let cancellation = CancellationToken::new();
-    let mut stream = provider
-        .infer(request("pause"), cancellation.clone())
-        .await
-        .unwrap();
-    assert!(matches!(
-        stream.next().await.unwrap().unwrap(),
-        ProviderEvent::TextDelta(_)
-    ));
-    std::fs::write(dir.path().join("release"), "ready").unwrap();
-    let mut failed = false;
-    while let Some(event) = stream.next().await {
-        match event {
-            Err(error) => {
-                assert!(matches!(error.kind, ErrorKind::Persistence));
-                failed = true;
-            }
-            Ok(ProviderEvent::Finished(_)) => panic!("DB failure must not complete successfully"),
-            Ok(_) => {}
-        }
-    }
-    assert!(failed);
     provider.shutdown().await;
     assert_process_terminated(dir.path()).await;
 }
@@ -829,12 +858,14 @@ async fn idle_oauth_refresh_preserves_credentials_and_coordinates_replicas() {
         "/must-not-run-claude".into(),
         PgStore::new(pool.clone()),
         ClaudeAuth::new(reqwest::Client::new(), endpoint.clone()),
+        Arc::new(llmproxy::metrics::Metrics::default()),
     );
     let second = ClaudeProvider::new(
         "claude-main".into(),
         "/must-not-run-claude".into(),
         PgStore::new(second_pool),
         ClaudeAuth::new(reqwest::Client::new(), endpoint),
+        Arc::new(llmproxy::metrics::Metrics::default()),
     );
     let imported = json!({"otherCredential":{"retain":true},"claudeAiOauth":{"accessToken":"old-access","refreshToken":"old-refresh","expiresAt":0,"refreshTokenExpiresAt":123456,"clientId":"custom-client","scopes":["user:inference","custom:scope"],"subscriptionType":"max","unknown":{"retain":true}}});
     sqlx::query("UPDATE claude_credentials SET credentials=$1 WHERE provider_id='claude-main'")
@@ -959,5 +990,196 @@ async fn idle_oauth_refresh_preserves_credentials_and_coordinates_replicas() {
         .unwrap();
     first.refresh_credentials().await.unwrap();
     assert_eq!(calls.lock().unwrap().len(), successful_calls);
+    server.abort();
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL PostgreSQL and local socket access"]
+async fn oauth_callbacks_coordinate_replicas_and_persist_after_cancellation() {
+    use axum::{Json, Router, routing::post};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (directory, _, pool) = fixture().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let (counter, arrived, proceed) = (calls.clone(), started.clone(), release.clone());
+    let app = Router::new().route("/token", post(move |Json(body): Json<Value>| {
+        let (counter, arrived, proceed) = (counter.clone(), arrived.clone(), proceed.clone());
+        async move {
+            assert_eq!(body["grant_type"], "refresh_token");
+            assert!(body["refresh_token"].as_str().unwrap().starts_with("fixture-refresh")
+                || body["refresh_token"].as_str().unwrap().starts_with("rotated-"));
+            let number = counter.fetch_add(1, Ordering::SeqCst) + 1;
+            arrived.add_permits(1);
+            proceed.acquire().await.unwrap().forget();
+            Json(json!({"access_token":format!("renewed-{number}"),"refresh_token":format!("rotated-{number}"),"expires_in":3600}))
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/token", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let other_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .unwrap();
+    let metrics = Arc::new(llmproxy::metrics::Metrics::default());
+    let first = Arc::new(ClaudeProvider::new(
+        "claude-main".into(),
+        directory.path().join("claude"),
+        PgStore::new(pool.clone()),
+        ClaudeAuth::new(reqwest::Client::new(), url.clone()),
+        metrics.clone(),
+    ));
+    let second = Arc::new(ClaudeProvider::new(
+        "claude-main".into(),
+        directory.path().join("claude"),
+        PgStore::new(other_pool),
+        ClaudeAuth::new(reqwest::Client::new(), url),
+        metrics.clone(),
+    ));
+    let mut jobs = Vec::new();
+    for provider in [first.clone(), second.clone()] {
+        jobs.push(tokio::spawn(async move {
+            let mut stream = provider
+                .infer(request("refresh-concurrent"), CancellationToken::new())
+                .await
+                .unwrap();
+            let mut finished = false;
+            while let Some(event) = stream.next().await {
+                if matches!(event.unwrap(), ProviderEvent::Finished(_)) {
+                    finished = true;
+                }
+            }
+            assert!(finished);
+        }));
+    }
+    tokio::time::timeout(Duration::from_secs(3), started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    // Maintenance and inference share refresh ownership even with single-connection pools.
+    let maintenance = {
+        let provider = second.clone();
+        tokio::spawn(async move {
+            provider.refresh_credentials().await.unwrap();
+        })
+    };
+    release.add_permits(1);
+    for job in jobs {
+        tokio::time::timeout(Duration::from_secs(5), job)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    maintenance.await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    // A child with an older token reuses an already persisted replacement.
+    let mut delayed = first
+        .infer(request("refresh-delayed"), CancellationToken::new())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !directory.path().join("auth-delayed").exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    sqlx::query("UPDATE claude_credentials SET credentials=jsonb_set(credentials,'{claudeAiOauth,accessToken}',$1) WHERE provider_id='claude-main'")
+        .bind(json!("newer-from-another-replica")).execute(&pool).await.unwrap();
+    std::fs::write(directory.path().join("auth-release"), "ready").unwrap();
+    while let Some(event) = delayed.next().await {
+        event.unwrap();
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    // A second rejection refers to the token last returned to that child.
+    release.add_permits(2);
+    let mut twice = first
+        .infer(request("refresh-twice"), CancellationToken::new())
+        .await
+        .unwrap();
+    while let Some(event) = twice.next().await {
+        event.unwrap();
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    started.acquire_many(2).await.unwrap().forget();
+
+    sqlx::raw_sql("CREATE FUNCTION reject_auth_update() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture rejection'; END $$; CREATE TRIGGER reject_auth_update BEFORE UPDATE ON claude_credentials FOR EACH ROW EXECUTE FUNCTION reject_auth_update();")
+        .execute(&pool).await.unwrap();
+    release.add_permits(1);
+    let mut failure = first
+        .infer(request("refresh-once"), CancellationToken::new())
+        .await
+        .unwrap();
+    let error = failure.next().await.unwrap().err().unwrap();
+    assert!(matches!(error.kind, ErrorKind::Persistence));
+    assert!(failure.next().await.is_none());
+    started.acquire().await.unwrap().forget();
+    sqlx::raw_sql("DROP TRIGGER reject_auth_update ON claude_credentials; DROP FUNCTION reject_auth_update();")
+        .execute(&pool).await.unwrap();
+
+    // Due request preparation and maintenance use the same refresh owner.
+    sqlx::query("UPDATE claude_credentials SET credentials=jsonb_set(credentials,'{claudeAiOauth,expiresAt}','0') WHERE provider_id='claude-main'")
+        .execute(&pool).await.unwrap();
+    release.add_permits(1);
+    let (a, b, maintained) = tokio::join!(
+        first.infer(request("success"), CancellationToken::new()),
+        second.infer(request("success"), CancellationToken::new()),
+        first.refresh_credentials(),
+    );
+    maintained.unwrap();
+    for mut stream in [a.unwrap(), b.unwrap()] {
+        while let Some(event) = stream.next().await {
+            event.unwrap();
+        }
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 5);
+    started.acquire().await.unwrap().forget();
+
+    let cancellation = CancellationToken::new();
+    let stream = first
+        .infer(request("refresh-once"), cancellation.clone())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    cancellation.cancel();
+    drop(stream);
+    release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(3), first.shutdown())
+        .await
+        .unwrap();
+    let persisted: Value = sqlx::query_scalar(
+        "SELECT credentials FROM claude_credentials WHERE provider_id='claude-main'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(persisted["claudeAiOauth"]["refreshToken"], "rotated-6");
+    assert_process_terminated(directory.path()).await;
+    second.shutdown().await;
+    let rendered = metrics.render().unwrap();
+    let observed: u64 = ["credential_refresh", "maintenance_credential_refresh"]
+        .iter()
+        .map(|stage| {
+            let prefix = format!("llmproxy_stage_duration_seconds_count{{stage=\"{stage}\"}} ");
+            rendered
+                .lines()
+                .find_map(|line| line.strip_prefix(&prefix))
+                .map(|value| value.parse::<u64>().unwrap())
+                .unwrap_or(0)
+        })
+        .sum();
+    assert_eq!(
+        observed, 6,
+        "refresh metrics must include persistence failure and cancelled callers"
+    );
     server.abort();
 }

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, process::ExitCode, sync::Arc, time::Duration};
 
 use llmproxy::{
     api::{ApiState, router},
@@ -18,18 +18,26 @@ use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> ExitCode {
+    let (writer, logs) = llmproxy::logging::writer(std::io::stdout());
     tracing_subscriber::fmt()
         .json()
-        .with_writer(std::io::stdout)
+        .with_writer(writer)
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("llmproxy=info")),
         )
         .init();
-    if let Err(error) = run().await {
+    let exit = if let Err(error) = run().await {
         tracing::error!(error = %error, "LLM proxy stopped");
-        std::process::exit(1);
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    };
+    if let Err(error) = logs.finish() {
+        eprintln!("Cannot flush LLM proxy logs: {error}");
+        return ExitCode::FAILURE;
     }
+    exit
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -52,6 +60,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .redirect(reqwest::redirect::Policy::none())
         .user_agent(concat!("llmproxy/", env!("CARGO_PKG_VERSION")))
         .build()?;
+    let metrics = Arc::new(Metrics::default());
     let mut providers = HashMap::<String, Arc<dyn Provider>>::new();
     for provider in config.providers {
         match provider {
@@ -64,6 +73,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         client.clone(),
                         CodexAuth::new(client.clone(), "https://auth.openai.com".into()),
                         "https://chatgpt.com/backend-api/codex/responses".into(),
+                        metrics.clone(),
                     )),
                 );
             }
@@ -78,12 +88,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             client.clone(),
                             "https://platform.claude.com/v1/oauth/token".into(),
                         ),
+                        metrics.clone(),
                     )),
                 );
             }
         }
     }
-    let metrics = Arc::new(Metrics::default());
     let maintenance_providers = providers.clone();
     let gateway = Arc::new(Gateway::new(
         store.clone(),
@@ -142,6 +152,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let maintenance_result = maintenance.await;
     gateway.shutdown().await;
     reconciliation.abort();
+    let _ = reconciliation.await;
     maintenance_result?;
     result?;
     Ok(())

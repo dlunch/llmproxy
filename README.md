@@ -99,7 +99,7 @@ Model mappings are read from PostgreSQL on each request. Adding or deleting a ro
 
 While the service is running, configured providers belonging to enabled accounts are checked at startup and every minute, even without inference traffic. Access tokens are refreshed within five minutes of expiry, or after 24 hours without a successful token update. Credentials without an access-token expiry are refreshed hourly. These checks call only OAuth endpoints and do not generate billable model requests.
 
-PostgreSQL row locks coordinate refresh with inference and other replicas; shutdown waits for in-flight refreshes to be saved. Failed attempts are retried on the next check. Revoked refresh tokens and absolute login expiry still require a new login, and credentials cannot be maintained while the service is stopped.
+Fresh credentials are read without an exclusive lock. PostgreSQL row locks coordinate refresh across requests and replicas; credentials are reread under the lock before exchanging a token. Shutdown waits for in-flight refreshes to be saved. Failed attempts are retried on the next check. Revoked refresh tokens and absolute login expiry still require a new login, and credentials cannot be maintained while the service is stopped.
 
 ### Codex
 
@@ -135,7 +135,7 @@ VALUES ('claude-main', '<.credentials.json contents>'::jsonb,
         '<.claude.json oauthAccount object>'::jsonb, '<.claude.json userID>', true);
 ```
 
-The service restores this login data into a private temporary configuration directory for each invocation and persists refreshed credentials before completing the request. Calls using the same provider ID are serialized across replicas with a PostgreSQL row lock held until the CLI exits and refreshed credentials are saved. Project settings, conversation history, and caches are not imported into the database.
+The host owns refresh tokens and initializes private account metadata for each invocation. Each CLI receives only its access token, allowing calls using the same provider ID to run concurrently. When the CLI requests a replacement token through its OAuth control protocol, the host coordinates refresh under a short PostgreSQL row lock and persists the result before replying. Concurrent refresh requests reuse a newer stored token. Cancellation does not discard an exchange that has already started. Child configuration, conversation history, and caches are not written back into the database.
 
 Each inference gets a private temporary working directory and a cleared process environment. Safe mode preserves subscription login while disabling user customizations; no inherited API-key/provider environment variables are passed. Built-in tools are disabled except `WebSearch` when requested. MCP configuration contains only the proxy's in-process function-schema bridge. Server shell/file tools are never exposed.
 
@@ -193,11 +193,17 @@ WHERE account_id = '11111111-1111-4111-8111-111111111111'
 ORDER BY started_at DESC;
 ```
 
-`provider_statistics` derives per-instance statistics from request records, including instances with no requests. Token totals sum only reported usage and stay null if no usage is known; `missing_usage_requests` exposes unreported usage. Latency averages finished requests in milliseconds. The view also exposes `running_requests`. Counters are derived rather than incremented separately, so concurrent completions cannot lose updates.
+`provider_statistics` derives per-instance statistics from request records, including instances with no requests. Token totals sum only reported usage and stay null if no usage is known; `missing_usage_requests` exposes unreported usage. Latency averages finished requests in milliseconds. The view also exposes `running_requests`.
+
+Routing reads stored `input_tokens`/`output_tokens` totals on `accounts` and `provider_instances`, avoiding a history scan on every request. A database trigger updates both totals atomically with request usage changes, including reported usage on failed or cancelled requests. Unknown usage contributes zero to routing totals while remaining null in request records. Counter updates briefly serialize completions for the same account. The usage-totals migration initializes existing data while holding a request writer lock; it does not discard history. Treat these totals as database-maintained fields.
 
 Stdout uses tracing's JSON format. Request/response body fields contain serialized JSON; streaming responses log each event, correlated by `request_id` and `account_id`. Request bodies and function arguments/results can contain sensitive application content, as requested; authentication headers and provider credentials are never added by the logger. Configure stdout retention/access in your deployment. `RUST_LOG` controls filtering; the default includes `llmproxy=info`.
 
-Prometheus exposes inference outcome counters, active requests, latency, provider errors, and observed token counters. Labels contain configured provider IDs and fixed outcomes/directions, not account IDs, arbitrary model input, or secrets. Failed authentication is rejected before provider accounting.
+Log output runs on a dedicated worker with a bounded 256-record queue and a standard output buffer flushed between batches. Formatting still runs on the caller; a full queue applies backpressure instead of dropping records. Graceful shutdown drains queued output and reports sink failures. The queue bounds record count rather than bytes, and a stalled stdout sink can delay requests or shutdown.
+
+Prometheus exposes inference outcome counters, active requests, latency, provider errors, and observed token counters. `llmproxy_stage_duration_seconds` measures `authentication`, `routing`, `credential_read`, `credential_lock`, `credential_refresh`, `provider_setup`, and `first_text`; background work uses separate `maintenance_credential_lock` and `maintenance_credential_refresh` stages. Buckets include millisecond-scale durations. Labels contain configured provider IDs and fixed stages/outcomes/directions, not account IDs, arbitrary model input, or secrets.
+
+The request-duration histogram starts at inference handler entry and ends after durable terminal accounting, including authentication and routing. Framework body extraction before handler entry and final client network drain are outside that interval. `first_text` ends at the first nonempty text delta received by the gateway; metadata, empty deltas, and tool-only responses do not count. Provider setup ends when `infer` returns its stream. Stage durations can overlap and should not be summed. Failed authentication contributes an authentication timing but is rejected before provider accounting.
 
 ## Verification
 
@@ -223,4 +229,4 @@ Run the request-path latency benchmark separately with a disposable `TEST_DATABA
 cargo test --release --locked --test api_integration proxy_latency_benchmark -- --ignored --nocapture
 ```
 
-It measures first-frame and complete-response latency for both APIs, with 128 KiB of input, 2,048 synthetic output deltas, and one or four concurrent requests. It includes PostgreSQL and in-process API handling; it excludes live upstream latency, network transport to the client, and production logging sinks.
+It measures first-frame, first-text, complete-response latency, and throughput for both APIs at concurrency one and four. Scenarios cover short responses, 128 KiB input with 2,048 synthetic output deltas, and 100,000 existing request records. Each scenario records 50 batches after five warm-ups. Full JSON logging writes to a temporary file and is drained before exit. Measurements include PostgreSQL and in-process API handling; they exclude live upstream latency, client network transport, and the deployment's log collector. Run benchmarks separately from builds and other tests.

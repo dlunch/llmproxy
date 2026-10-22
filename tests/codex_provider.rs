@@ -267,12 +267,14 @@ async fn codex_streams_and_refreshes_once_with_persisted_quota_and_failure_outco
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .unwrap();
+    let metrics = Arc::new(llmproxy::metrics::Metrics::default());
     let provider = Arc::new(CodexProvider::new(
         provider_id.clone(),
         store.clone(),
         client.clone(),
         CodexAuth::new(client.clone(), url.clone()),
         format!("{url}/responses"),
+        metrics.clone(),
     ));
     let second_pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
@@ -285,6 +287,7 @@ async fn codex_streams_and_refreshes_once_with_persisted_quota_and_failure_outco
         client.clone(),
         CodexAuth::new(client, url.clone()),
         format!("{url}/responses"),
+        metrics.clone(),
     );
     let mut system_request = request("ok");
     system_request.messages[0].role = Role::System;
@@ -319,6 +322,30 @@ async fn codex_streams_and_refreshes_once_with_persisted_quota_and_failure_outco
     let credentials: CodexCredentials = sqlx::query_as("SELECT access_token,refresh_token,account_id,expires_at,updated_at FROM provider_credentials WHERE provider_id=$1")
         .bind(&provider_id).fetch_one(&pool).await.unwrap();
     assert_eq!(credentials.refresh_token, "rotated");
+    let before_fresh = metrics.render().unwrap();
+    let lock_count = before_fresh.lines().find(|line| {
+        line.starts_with("llmproxy_stage_duration_seconds_count{stage=\"credential_lock\"}")
+    });
+    // Fresh inference must not wait for another replica's credential row lock.
+    let (held, _) = store.lock_codex_credentials(&provider_id).await.unwrap();
+    let mut unlocked = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        second_provider.infer(request("ok"), CancellationToken::new()),
+    )
+    .await
+    .expect("fresh credentials waited for an exclusive lock")
+    .unwrap();
+    while let Some(event) = unlocked.next().await {
+        event.unwrap();
+    }
+    held.commit().await.unwrap();
+    let after_fresh = metrics.render().unwrap();
+    assert_eq!(
+        lock_count,
+        after_fresh.lines().find(|line| line
+            .starts_with("llmproxy_stage_duration_seconds_count{stage=\"credential_lock\"}"))
+    );
+
     provider.refresh_credentials().await.unwrap();
     assert_eq!(refreshes.load(Ordering::SeqCst), 1);
     assert!(
@@ -597,6 +624,23 @@ async fn codex_streams_and_refreshes_once_with_persisted_quota_and_failure_outco
         "rotated"
     );
     assert_eq!(refreshes.load(Ordering::SeqCst), 6);
+    let rendered = metrics.render().unwrap();
+    for (stage, expected) in [
+        ("credential_refresh", 2),
+        ("maintenance_credential_refresh", 4),
+    ] {
+        let prefix = format!("llmproxy_stage_duration_seconds_count{{stage=\"{stage}\"}} ");
+        let observed = rendered
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        assert_eq!(
+            observed, expected,
+            "refresh metrics must include rejection and cancelled callers"
+        );
+    }
     second_pool.close().await;
     pool.close().await;
     sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))

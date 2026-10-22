@@ -62,9 +62,14 @@ impl Provider for FakeProvider {
                 }),
                 Ok(ProviderEvent::Finished(FinishReason::ToolCalls)),
             ])))
-        } else if request.messages[0].content == "pause" {
+        } else if matches!(
+            request.messages[0].content.as_str(),
+            "pause" | "usage-then-wait"
+        ) {
+            let wait = request.messages[0].content == "usage-then-wait";
             Ok(Box::pin(async_stream::stream! {
                 yield Ok(ProviderEvent::Usage(Usage { input_tokens: 1, output_tokens: 1 }));
+                if wait { std::future::pending::<()>().await; }
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 yield Ok(ProviderEvent::Finished(FinishReason::Stop));
             }))
@@ -222,7 +227,7 @@ async fn postgres_gateway_lifecycle_routing_and_cancellation() {
         Duration::from_secs(1),
     );
     let mut first = gateway
-        .execute(principal(), request("hello"))
+        .execute(principal(), request("hello"), std::time::Instant::now())
         .await
         .unwrap();
     let id = first.request_id;
@@ -240,7 +245,7 @@ async fn postgres_gateway_lifecycle_routing_and_cancellation() {
             .unwrap();
     assert_eq!(row, ("succeeded".into(), Some(3), Some(2)));
     let mut second = gateway
-        .execute(principal(), request("hello"))
+        .execute(principal(), request("hello"), std::time::Instant::now())
         .await
         .unwrap();
     assert!(
@@ -266,6 +271,7 @@ async fn postgres_gateway_lifecycle_routing_and_cancellation() {
                 credential: llmproxy::core::Credential::ApiToken(other_token),
             },
             request("hello"),
+            std::time::Instant::now(),
         )
         .await
         .unwrap();
@@ -278,7 +284,7 @@ async fn postgres_gateway_lifecycle_routing_and_cancellation() {
     let mut excluded = request("hello");
     excluded.model = "foreign-only".into();
     assert!(
-        matches!(gateway.execute(principal(),excluded).await,Err(error) if matches!(error.kind,llmproxy::core::ErrorKind::ModelNotFound))
+        matches!(gateway.execute(principal(),excluded, std::time::Instant::now()).await,Err(error) if matches!(error.kind,llmproxy::core::ErrorKind::ModelNotFound))
     );
     assert!(matches!(store.begin_request(llmproxy::store::NewRequest {
         id:Uuid::new_v4(),account_id,token_id:Some(token_id),ip_range_id:None,client_ip:None,
@@ -295,7 +301,7 @@ async fn postgres_gateway_lifecycle_routing_and_cancellation() {
     assert!(matches!(gateway.execute(llmproxy::core::Principal {
         account_id: other_account,
         credential: llmproxy::core::Credential::ApiToken(other_token),
-    }, removed).await, Err(error) if matches!(error.kind, llmproxy::core::ErrorKind::ModelNotFound)));
+    }, removed, std::time::Instant::now()).await, Err(error) if matches!(error.kind, llmproxy::core::ErrorKind::ModelNotFound)));
     for (id, owner) in [
         (&a, account_id),
         (&b, account_id),
@@ -331,7 +337,7 @@ async fn postgres_gateway_lifecycle_routing_and_cancellation() {
         .await
         .unwrap();
     let mut third = gateway
-        .execute(principal(), request("hello"))
+        .execute(principal(), request("hello"), std::time::Instant::now())
         .await
         .unwrap();
     assert!(
@@ -340,13 +346,19 @@ async fn postgres_gateway_lifecycle_routing_and_cancellation() {
     while let Some(event) = third.next().await {
         event.unwrap();
     }
-    let mut timed = gateway.execute(principal(), request("wait")).await.unwrap();
+    let mut timed = gateway
+        .execute(principal(), request("wait"), std::time::Instant::now())
+        .await
+        .unwrap();
     let timed_id = timed.request_id;
     assert!(matches!(
         timed.next().await.unwrap().err().unwrap().kind,
         llmproxy::core::ErrorKind::Timeout
     ));
-    let cancelled = gateway.execute(principal(), request("wait")).await.unwrap();
+    let cancelled = gateway
+        .execute(principal(), request("wait"), std::time::Instant::now())
+        .await
+        .unwrap();
     let cancelled_id = cancelled.request_id;
     drop(cancelled);
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -372,7 +384,7 @@ async fn postgres_gateway_lifecycle_routing_and_cancellation() {
     assert_eq!(outcome, "timed_out");
     let concurrent = (0..4).map(|_| async {
         let mut stream = gateway
-            .execute(principal(), request("hello"))
+            .execute(principal(), request("hello"), std::time::Instant::now())
             .await
             .unwrap();
         while let Some(event) = stream.next().await {
@@ -390,7 +402,7 @@ async fn postgres_gateway_lifecycle_routing_and_cancellation() {
     unknown.model = "unknown".into();
     assert!(matches!(
         gateway
-            .execute(principal(), unknown)
+            .execute(principal(), unknown, std::time::Instant::now())
             .await
             .err()
             .unwrap()
@@ -411,7 +423,7 @@ async fn postgres_gateway_lifecycle_routing_and_cancellation() {
         .unwrap();
     assert!(matches!(
         gateway
-            .execute(principal(), request("hello"))
+            .execute(principal(), request("hello"), std::time::Instant::now())
             .await
             .err()
             .unwrap()
@@ -426,7 +438,7 @@ async fn postgres_gateway_lifecycle_routing_and_cancellation() {
     .await
     .unwrap();
     let mut broken = gateway
-        .execute(principal(), request("truncated"))
+        .execute(principal(), request("truncated"), std::time::Instant::now())
         .await
         .unwrap();
     let broken_id = broken.request_id;
@@ -452,7 +464,8 @@ async fn postgres_gateway_lifecycle_routing_and_cancellation() {
                     account_id,
                     credential: llmproxy::core::Credential::ApiToken(Uuid::new_v4())
                 },
-                request("hello")
+                request("hello"),
+                std::time::Instant::now()
             )
             .await
             .err()
@@ -461,7 +474,7 @@ async fn postgres_gateway_lifecycle_routing_and_cancellation() {
         llmproxy::core::ErrorKind::Persistence
     ));
     let mut unsaved = gateway
-        .execute(principal(), request("pause"))
+        .execute(principal(), request("pause"), std::time::Instant::now())
         .await
         .unwrap();
     let unsaved_id = unsaved.request_id;
@@ -479,7 +492,11 @@ async fn postgres_gateway_lifecycle_routing_and_cancellation() {
         llmproxy::core::ErrorKind::Persistence
     ));
     let mut oversized = gateway
-        .execute(principal(), request("oversized-tool"))
+        .execute(
+            principal(),
+            request("oversized-tool"),
+            std::time::Instant::now(),
+        )
         .await
         .unwrap();
     assert!(matches!(
@@ -501,6 +518,7 @@ async fn postgres_gateway_lifecycle_routing_and_cancellation() {
         .execute(
             store.authenticate_ip(client_ip).await.unwrap().unwrap(),
             request("hello"),
+            std::time::Instant::now(),
         )
         .await
         .unwrap();
@@ -577,6 +595,7 @@ async fn postgres_gateway_lifecycle_routing_and_cancellation() {
                 .unwrap()
                 .unwrap(),
             request("hello"),
+            std::time::Instant::now(),
         )
         .await
         .unwrap();
@@ -585,6 +604,32 @@ async fn postgres_gateway_lifecycle_routing_and_cancellation() {
     }
     let usage = store.account_usage(account_id).await.unwrap();
     assert_eq!(usage.input_tokens + usage.output_tokens, 47);
+    let mut cancelled_with_usage = gateway
+        .execute(
+            principal(),
+            request("usage-then-wait"),
+            std::time::Instant::now(),
+        )
+        .await
+        .unwrap();
+    let cancelled_with_usage_id = cancelled_with_usage.request_id;
+    assert!(matches!(
+        cancelled_with_usage.next().await.unwrap().unwrap(),
+        ProviderEvent::Usage(_)
+    ));
+    drop(cancelled_with_usage);
+    gateway.shutdown().await;
+    let outcome: String = sqlx::query_scalar("SELECT outcome FROM requests WHERE id=$1")
+        .bind(cancelled_with_usage_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(outcome, "cancelled");
+    let usage = store.account_usage(account_id).await.unwrap();
+    assert_eq!(usage.input_tokens + usage.output_tokens, 49);
+    let totals_match: bool = sqlx::query_scalar("SELECT p.input_tokens=COALESCE(sum(r.input_tokens),0) AND p.output_tokens=COALESCE(sum(r.output_tokens),0) FROM provider_instances p LEFT JOIN requests r ON r.provider_id=p.id WHERE p.id=$1 GROUP BY p.id")
+        .bind(&b).fetch_one(&pool).await.unwrap();
+    assert!(totals_match);
     let expired_id = Uuid::new_v4();
     store
         .begin_request(llmproxy::store::NewRequest {
@@ -645,4 +690,300 @@ async fn postgres_gateway_lifecycle_routing_and_cancellation() {
         store.authenticate_token(&digest).await.err().unwrap().kind,
         llmproxy::core::ErrorKind::Persistence
     ));
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL pointing to disposable PostgreSQL"]
+async fn usage_migration_and_mutations_preserve_atomic_totals() {
+    let url = std::env::var("TEST_DATABASE_URL").unwrap();
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .unwrap();
+    let schema = format!("usage_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let search_path = format!("SET search_path TO {schema}");
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .after_connect(move |connection, _| {
+            let search_path = search_path.clone();
+            Box::pin(async move {
+                sqlx::query(&search_path).execute(connection).await?;
+                Ok(())
+            })
+        })
+        .connect(&url)
+        .await
+        .unwrap();
+    let initial = tempfile::tempdir().unwrap();
+    std::fs::write(
+        initial.path().join("0001_initial.sql"),
+        include_str!("../migrations/0001_initial.sql"),
+    )
+    .unwrap();
+    sqlx::migrate::Migrator::new(initial.path())
+        .await
+        .unwrap()
+        .run(&pool)
+        .await
+        .unwrap();
+    let account = Uuid::new_v4();
+    let token = Uuid::new_v4();
+    let historical = Uuid::new_v4();
+    sqlx::query("INSERT INTO accounts(id,label) VALUES ($1,'usage')")
+        .bind(account)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO provider_instances(id,account_id) VALUES ('provider',$1)")
+        .bind(account)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO api_tokens(id,account_id,label,token_hash) VALUES ($1,$2,'usage',$3)")
+        .bind(token)
+        .bind(account)
+        .bind(vec![0u8; 32])
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO requests(id,account_id,api_token_id,requested_model,provider_id,upstream_model,started_at,deadline_at,outcome,input_tokens) VALUES ($1,$2,$3,'test','provider','test',now(),now(),'failed',11)")
+        .bind(historical).bind(account).bind(token).execute(&pool).await.unwrap();
+    let store = PgStore::new(pool.clone());
+    store.migrate().await.unwrap();
+    let totals: (i64, i64) =
+        sqlx::query_as("SELECT input_tokens,output_tokens FROM accounts WHERE id=$1")
+            .bind(account)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(totals, (11, 0));
+    let usage = store.account_usage(account).await.unwrap();
+    assert_eq!((usage.input_tokens, usage.output_tokens), (11, 0));
+    assert_eq!(
+        store
+            .provider_states(account, &["provider".into()])
+            .await
+            .unwrap()[0]
+            .accumulated_tokens,
+        11
+    );
+
+    let inserted = Uuid::new_v4();
+    sqlx::query("INSERT INTO requests(id,account_id,api_token_id,requested_model,provider_id,upstream_model,started_at,deadline_at,outcome,input_tokens,output_tokens) VALUES ($1,$2,$3,'test','provider','test',now(),now(),'succeeded',2,4)")
+        .bind(inserted).bind(account).bind(token).execute(&pool).await.unwrap();
+    let usage = store.account_usage(account).await.unwrap();
+    assert_eq!((usage.input_tokens, usage.output_tokens), (13, 4));
+    sqlx::query("DELETE FROM requests WHERE id=$1")
+        .bind(inserted)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let running = Uuid::new_v4();
+    store
+        .begin_request(llmproxy::store::NewRequest {
+            id: running,
+            account_id: account,
+            token_id: Some(token),
+            ip_range_id: None,
+            client_ip: None,
+            requested_model: "test",
+            provider_id: "provider",
+            upstream_model: "test",
+            started_at: Utc::now(),
+            deadline_at: Utc::now() + chrono::Duration::seconds(30),
+        })
+        .await
+        .unwrap();
+    let usage = Usage {
+        input_tokens: 3,
+        output_tokens: 5,
+    };
+    let (first, second) = tokio::join!(
+        store.finish_request(running, "cancelled", None, Some(&usage)),
+        store.finish_request(running, "cancelled", None, Some(&usage))
+    );
+    assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+    let usage = store.account_usage(account).await.unwrap();
+    assert_eq!((usage.input_tokens, usage.output_tokens), (14, 5));
+    sqlx::query("UPDATE requests SET input_tokens=7,output_tokens=2 WHERE id=$1")
+        .bind(historical)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let usage = store.account_usage(account).await.unwrap();
+    assert_eq!((usage.input_tokens, usage.output_tokens), (10, 7));
+    sqlx::query("DELETE FROM requests WHERE id=$1")
+        .bind(historical)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let usage = store.account_usage(account).await.unwrap();
+    assert_eq!((usage.input_tokens, usage.output_tokens), (3, 5));
+
+    let unsaved = Uuid::new_v4();
+    store
+        .begin_request(llmproxy::store::NewRequest {
+            id: unsaved,
+            account_id: account,
+            token_id: Some(token),
+            ip_range_id: None,
+            client_ip: None,
+            requested_model: "test",
+            provider_id: "provider",
+            upstream_model: "test",
+            started_at: Utc::now(),
+            deadline_at: Utc::now() + chrono::Duration::seconds(30),
+        })
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE provider_instances ADD CONSTRAINT test_counter_failure CHECK(input_tokens <= 3)").execute(&pool).await.unwrap();
+    assert!(
+        store
+            .finish_request(
+                unsaved,
+                "succeeded",
+                None,
+                Some(&Usage {
+                    input_tokens: 1,
+                    output_tokens: 1
+                })
+            )
+            .await
+            .is_err()
+    );
+    let row: (String, Option<i64>, Option<i64>) =
+        sqlx::query_as("SELECT outcome,input_tokens,output_tokens FROM requests WHERE id=$1")
+            .bind(unsaved)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(row, ("running".into(), None, None));
+    let usage = store.account_usage(account).await.unwrap();
+    assert_eq!((usage.input_tokens, usage.output_tokens), (3, 5));
+    assert_eq!(
+        store
+            .provider_states(account, &["provider".into()])
+            .await
+            .unwrap()[0]
+            .accumulated_tokens,
+        8
+    );
+    sqlx::query("ALTER TABLE provider_instances DROP CONSTRAINT test_counter_failure")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let now = Utc::now();
+    store
+        .save_quota(
+            "provider",
+            &[
+                QuotaWindow {
+                    key: "short".into(),
+                    observed_at: now,
+                    remaining_fraction: 0.25,
+                    resets_at: None,
+                },
+                QuotaWindow {
+                    key: "long".into(),
+                    observed_at: now,
+                    remaining_fraction: 0.75,
+                    resets_at: None,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .save_quota(
+                "provider",
+                &[
+                    QuotaWindow {
+                        key: "short".into(),
+                        observed_at: now + chrono::Duration::seconds(1),
+                        remaining_fraction: 0.5,
+                        resets_at: None
+                    },
+                    QuotaWindow {
+                        key: "long".into(),
+                        observed_at: now + chrono::Duration::seconds(1),
+                        remaining_fraction: 2.0,
+                        resets_at: None
+                    },
+                ]
+            )
+            .await
+            .is_err()
+    );
+    store
+        .save_quota(
+            "provider",
+            &[
+                QuotaWindow {
+                    key: "short".into(),
+                    observed_at: now - chrono::Duration::seconds(1),
+                    remaining_fraction: 1.0,
+                    resets_at: None,
+                },
+                QuotaWindow {
+                    key: "long".into(),
+                    observed_at: now - chrono::Duration::seconds(1),
+                    remaining_fraction: 1.0,
+                    resets_at: None,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    let windows: Vec<(String, f64)> = sqlx::query_as(
+        "SELECT window_key,remaining_fraction FROM provider_quota ORDER BY window_key",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(windows, vec![("long".into(), 0.75), ("short".into(), 0.25)]);
+    let writes = (0..16).map(|index| {
+        let store = &store;
+        async move {
+            let mut windows = [
+                QuotaWindow {
+                    key: "short".into(),
+                    observed_at: now + chrono::Duration::seconds(index + 2),
+                    remaining_fraction: 0.5,
+                    resets_at: None,
+                },
+                QuotaWindow {
+                    key: "long".into(),
+                    observed_at: now + chrono::Duration::seconds(index + 2),
+                    remaining_fraction: 0.5,
+                    resets_at: None,
+                },
+            ];
+            if index % 2 == 0 {
+                windows.reverse();
+            }
+            store.save_quota("provider", &windows).await.unwrap();
+        }
+    });
+    futures_util::future::join_all(writes).await;
+    let windows: Vec<(String, f64)> = sqlx::query_as(
+        "SELECT window_key,remaining_fraction FROM provider_quota ORDER BY window_key",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(windows, vec![("long".into(), 0.5), ("short".into(), 0.5)]);
+    store.save_quota("provider", &[]).await.unwrap();
+    pool.close().await;
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    admin.close().await;
 }

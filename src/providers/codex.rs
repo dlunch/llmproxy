@@ -1,4 +1,4 @@
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -18,6 +18,7 @@ use crate::{
         ErrorKind, EventStream, FinishReason, InferenceRequest, Provider, ProviderEvent,
         ProxyError, Role, Tool, ToolChoice, Usage, WebSearchStatus,
     },
+    metrics::{Metrics, Stage},
     store::{CodexCredentials, PgStore, QuotaWindow},
 };
 
@@ -268,6 +269,7 @@ pub struct CodexProvider {
     auth: CodexAuth,
     responses_url: String,
     workers: TaskTracker,
+    metrics: Arc<Metrics>,
 }
 
 impl CodexProvider {
@@ -277,6 +279,7 @@ impl CodexProvider {
         client: Client,
         auth: CodexAuth,
         responses_url: String,
+        metrics: Arc<Metrics>,
     ) -> Self {
         Self {
             provider_id,
@@ -285,6 +288,7 @@ impl CodexProvider {
             auth,
             responses_url,
             workers: TaskTracker::new(),
+            metrics,
         }
     }
 
@@ -292,13 +296,16 @@ impl CodexProvider {
         &self,
         transaction: Transaction<'static, Postgres>,
         credentials: CodexCredentials,
+        refresh_stage: Stage,
     ) -> Result<CodexCredentials, ProxyError> {
         let auth = self.auth.clone();
         let provider_id = self.provider_id.clone();
+        let metrics = self.metrics.clone();
         // Request cancellation must not discard a rotated token before persistence.
         self.workers
             .spawn(async move {
                 if credentials_need_refresh(credentials.expires_at, credentials.updated_at) {
+                    let _timer = metrics.time_stage(refresh_stage);
                     let updated = auth.refresh(&credentials).await?;
                     PgStore::save_codex_credentials(transaction, &provider_id, &updated).await?;
                     tracing::info!(provider_id, "OAuth credentials refreshed");
@@ -316,15 +323,21 @@ impl CodexProvider {
 #[async_trait]
 impl Provider for CodexProvider {
     async fn refresh_credentials(&self) -> Result<(), ProxyError> {
-        let Some((transaction, credentials)) = self
+        let timer = self.metrics.time_stage(Stage::MaintenanceCredentialLock);
+        let locked = self
             .store
             .try_lock_codex_credentials(&self.provider_id)
-            .await?
-        else {
+            .await;
+        drop(timer);
+        let Some((transaction, credentials)) = locked? else {
             return Ok(());
         };
-        self.refresh_locked_credentials(transaction, credentials)
-            .await?;
+        self.refresh_locked_credentials(
+            transaction,
+            credentials,
+            Stage::MaintenanceCredentialRefresh,
+        )
+        .await?;
         Ok(())
     }
 
@@ -394,14 +407,26 @@ impl Provider for CodexProvider {
         if cancellation.is_cancelled() {
             return Err(ProxyError::new(ErrorKind::Cancelled, "Request cancelled"));
         }
-        let (transaction, credentials) = tokio::select! {
-            _ = cancellation.cancelled() => return Err(ProxyError::new(ErrorKind::Cancelled, "Request cancelled")),
-            locked = self.store.lock_codex_credentials(&self.provider_id) => locked?,
+        let timer = self.metrics.time_stage(Stage::CredentialRead);
+        let loaded = tokio::select! {
+            _ = cancellation.cancelled() => Err(ProxyError::new(ErrorKind::Cancelled, "Request cancelled")),
+            result = self.store.codex_credentials(&self.provider_id) => result,
         };
-        let credentials = tokio::select! {
-            _ = cancellation.cancelled() => return Err(ProxyError::new(ErrorKind::Cancelled, "Request cancelled")),
-            result = self.refresh_locked_credentials(transaction, credentials) => result?,
-        };
+        drop(timer);
+        let mut credentials = loaded?;
+        if credentials_need_refresh(credentials.expires_at, credentials.updated_at) {
+            let timer = self.metrics.time_stage(Stage::CredentialLock);
+            let locked = tokio::select! {
+                _ = cancellation.cancelled() => Err(ProxyError::new(ErrorKind::Cancelled, "Request cancelled")),
+                result = self.store.lock_codex_credentials(&self.provider_id) => result,
+            };
+            drop(timer);
+            let (transaction, current) = locked?;
+            credentials = tokio::select! {
+                _ = cancellation.cancelled() => return Err(ProxyError::new(ErrorKind::Cancelled, "Request cancelled")),
+                result = self.refresh_locked_credentials(transaction, current, Stage::CredentialRefresh) => result?,
+            };
+        }
         let mut body = json!({"model":request.model, "stream":true, "store":false,
             "parallel_tool_calls":false, "reasoning":null, "include":[]});
         body["input"] = Value::Array(input);

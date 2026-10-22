@@ -1,8 +1,8 @@
 use std::{
     collections::{HashMap, HashSet},
-    io::Read,
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::Stdio,
+    sync::Arc,
     time::Duration,
 };
 
@@ -12,6 +12,7 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sqlx::{Postgres, Transaction};
 use tokio::{
     io::AsyncWriteExt,
     process::{ChildStdin, Command},
@@ -30,11 +31,13 @@ use crate::core::{
 };
 
 use super::{auth_json, credentials_need_refresh};
-use crate::store::{PgStore, QuotaWindow};
+use crate::metrics::{Metrics, Stage};
+use crate::store::{ClaudeCredentials, PgStore, QuotaWindow};
 
 const DEFAULT_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const DEFAULT_SCOPES: &str = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload user:plugins";
 
+#[derive(Clone)]
 pub struct ClaudeAuth {
     client: Client,
     token_url: String,
@@ -126,60 +129,164 @@ impl ClaudeAuth {
     }
 }
 
+#[derive(Clone)]
 pub struct ClaudeProvider {
     id: String,
     store: PgStore,
     workers: TaskTracker,
     executable: PathBuf,
     auth: ClaudeAuth,
+    metrics: Arc<Metrics>,
 }
 
 impl ClaudeProvider {
-    pub fn new(id: String, executable: PathBuf, store: PgStore, auth: ClaudeAuth) -> Self {
+    pub fn new(
+        id: String,
+        executable: PathBuf,
+        store: PgStore,
+        auth: ClaudeAuth,
+        metrics: Arc<Metrics>,
+    ) -> Self {
         Self {
             executable,
             auth,
             id,
             store,
             workers: TaskTracker::new(),
+            metrics,
         }
+    }
+
+    async fn credentials(
+        &self,
+        rejected_token: Option<&str>,
+        cancellation: &CancellationToken,
+    ) -> Result<ClaudeCredentials, ProxyError> {
+        if rejected_token.is_none() {
+            let timer = self.metrics.time_stage(Stage::CredentialRead);
+            let loaded = tokio::select! {
+                _ = cancellation.cancelled() => Err(ProxyError::new(ErrorKind::Cancelled, "Request cancelled")),
+                result = self.store.claude_credentials(&self.id) => result,
+            };
+            drop(timer);
+            let credentials = loaded?;
+            let oauth = &credentials.credentials["claudeAiOauth"];
+            let expires_at = oauth["expiresAt"]
+                .as_i64()
+                .and_then(DateTime::from_timestamp_millis);
+            if !oauth["refreshToken"]
+                .as_str()
+                .is_some_and(|token| !token.is_empty())
+                || !credentials_need_refresh(expires_at, credentials.updated_at)
+            {
+                if expires_at.is_some_and(|expiry| expiry <= Utc::now()) {
+                    return Err(ProxyError::new(
+                        ErrorKind::UpstreamAuth,
+                        "Claude access token expired",
+                    ));
+                }
+                return Ok(credentials);
+            }
+        }
+        let timer = self.metrics.time_stage(Stage::CredentialLock);
+        let locked = tokio::select! {
+            _ = cancellation.cancelled() => Err(ProxyError::new(ErrorKind::Cancelled, "Request cancelled")),
+            result = self.store.lock_claude_credentials(&self.id) => result,
+        };
+        drop(timer);
+        let (transaction, credentials) = locked?;
+        tokio::select! {
+            _ = cancellation.cancelled() => Err(ProxyError::new(ErrorKind::Cancelled, "Request cancelled")),
+            result = self.refresh_locked_credentials(transaction, credentials, rejected_token, Stage::CredentialRefresh) => result,
+        }
+    }
+
+    async fn refresh_locked_credentials(
+        &self,
+        transaction: Transaction<'static, Postgres>,
+        mut credentials: ClaudeCredentials,
+        rejected_token: Option<&str>,
+        refresh_stage: Stage,
+    ) -> Result<ClaudeCredentials, ProxyError> {
+        let auth = self.auth.clone();
+        let id = self.id.clone();
+        let metrics = self.metrics.clone();
+        let rejected_token = rejected_token.map(str::to_owned);
+        // Once an exchange starts, cancellation cannot discard the rotated refresh token.
+        self.workers
+            .spawn(async move {
+                let oauth = credentials
+                    .credentials
+                    .get_mut("claudeAiOauth")
+                    .and_then(Value::as_object_mut);
+                let Some(oauth) = oauth else {
+                    if rejected_token.is_some() {
+                        return Err(ProxyError::new(
+                            ErrorKind::UpstreamAuth,
+                            "Claude OAuth credentials missing",
+                        ));
+                    }
+                    transaction.commit().await?;
+                    return Ok(credentials);
+                };
+                let expires_at = oauth
+                    .get("expiresAt")
+                    .and_then(Value::as_i64)
+                    .and_then(DateTime::from_timestamp_millis);
+                let refresh = match &rejected_token {
+                    Some(rejected) => {
+                        oauth.get("accessToken").and_then(Value::as_str) == Some(rejected.as_str())
+                    }
+                    None => credentials_need_refresh(expires_at, credentials.updated_at),
+                };
+                if !refresh {
+                    transaction.commit().await?;
+                    return Ok(credentials);
+                }
+                let refresh_token = oauth
+                    .get("refreshToken")
+                    .and_then(Value::as_str)
+                    .filter(|token| !token.is_empty())
+                    .map(str::to_owned);
+                let Some(refresh_token) = refresh_token else {
+                    if rejected_token.is_some() {
+                        return Err(ProxyError::new(
+                            ErrorKind::UpstreamAuth,
+                            "Claude refresh token missing",
+                        ));
+                    }
+                    transaction.commit().await?;
+                    return Ok(credentials);
+                };
+                let _timer = metrics.time_stage(refresh_stage);
+                auth.refresh(oauth, &refresh_token).await?;
+                PgStore::save_claude_credentials(transaction, &id, &credentials).await?;
+                Ok(credentials)
+            })
+            .await
+            .map_err(|_| {
+                ProxyError::new(ErrorKind::UpstreamAuth, "Claude credential task failed")
+            })?
     }
 }
 
 #[async_trait]
 impl Provider for ClaudeProvider {
     async fn refresh_credentials(&self) -> Result<(), ProxyError> {
-        let Some((transaction, mut credentials)) =
-            self.store.try_lock_claude_credentials(&self.id).await?
-        else {
+        let timer = self.metrics.time_stage(Stage::MaintenanceCredentialLock);
+        let locked = self.store.try_lock_claude_credentials(&self.id).await;
+        drop(timer);
+        let Some((transaction, credentials)) = locked? else {
             return Ok(());
         };
-        let oauth = credentials
-            .credentials
-            .get_mut("claudeAiOauth")
-            .and_then(Value::as_object_mut);
-        let eligible = oauth.and_then(|oauth| {
-            let token = oauth
-                .get("refreshToken")
-                .and_then(Value::as_str)
-                .filter(|token| !token.is_empty())?
-                .to_owned();
-            Some((oauth, token))
-        });
-        let Some((oauth, refresh_token)) = eligible else {
-            transaction.commit().await?;
-            return Ok(());
-        };
-        let expires_at = oauth
-            .get("expiresAt")
-            .and_then(Value::as_i64)
-            .and_then(DateTime::from_timestamp_millis);
-        if !credentials_need_refresh(expires_at, credentials.updated_at) {
-            transaction.commit().await?;
-            return Ok(());
-        }
-        self.auth.refresh(oauth, &refresh_token).await?;
-        PgStore::save_claude_credentials(transaction, &self.id, &credentials).await
+        self.refresh_locked_credentials(
+            transaction,
+            credentials,
+            None,
+            Stage::MaintenanceCredentialRefresh,
+        )
+        .await?;
+        Ok(())
     }
 
     async fn shutdown(&self) {
@@ -233,10 +340,12 @@ impl Provider for ClaudeProvider {
                 }
             }
         }
-        let (transaction, mut credentials) = tokio::select! {
-            _ = cancellation.cancelled() => return Err(ProxyError::new(ErrorKind::Cancelled, "Request cancelled")),
-            locked = self.store.lock_claude_credentials(&self.id) => locked?,
-        };
+        let credentials = self.credentials(None, &cancellation).await?;
+        let mut access_token = credentials.credentials["claudeAiOauth"]["accessToken"]
+            .as_str()
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| ProxyError::new(ErrorKind::UpstreamAuth, "Claude access token missing"))?
+            .to_owned();
         let work = tempfile::tempdir().map_err(|_| {
             ProxyError::new(
                 ErrorKind::Unavailable,
@@ -258,17 +367,12 @@ impl Provider for ClaudeProvider {
         if let Some(user_id) = &credentials.user_id {
             auth_config["userID"] = json!(user_id);
         }
-        for (name, value) in [
-            (".credentials.json", &credentials.credentials),
-            (".claude.json", &auth_config),
-        ] {
-            std::fs::write(config_dir.join(name), value.to_string()).map_err(|_| {
-                ProxyError::new(
-                    ErrorKind::Unavailable,
-                    "Cannot prepare Claude authentication",
-                )
-            })?;
-        }
+        std::fs::write(config_dir.join(".claude.json"), auth_config.to_string()).map_err(|_| {
+            ProxyError::new(
+                ErrorKind::Unavailable,
+                "Cannot prepare Claude authentication",
+            )
+        })?;
         let mut system = Vec::new();
         let mut conversation = Vec::<(String, Vec<Value>)>::new();
         for message in request.messages {
@@ -401,6 +505,9 @@ impl Provider for ClaudeProvider {
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", work.path())
             .env("CLAUDE_CONFIG_DIR", &config_dir)
+            .env("CLAUDE_CODE_OAUTH_TOKEN", &access_token)
+            .env("CLAUDE_CODE_ENTRYPOINT", "local-agent")
+            .env("CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH", "1")
             .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
             .env("DISABLE_AUTOUPDATER", "1")
             .current_dir(work.path())
@@ -408,6 +515,26 @@ impl Provider for ClaudeProvider {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
+        let oauth = &credentials.credentials["claudeAiOauth"];
+        if let Some(scopes) = oauth["scopes"].as_array() {
+            let scopes = scopes
+                .iter()
+                .map(|scope| {
+                    scope.as_str().ok_or_else(|| {
+                        ProxyError::new(ErrorKind::UpstreamAuth, "Invalid Claude OAuth scopes")
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            command.env("CLAUDE_CODE_OAUTH_SCOPES", scopes.join(" "));
+        }
+        for (field, variable) in [
+            ("subscriptionType", "CLAUDE_CODE_SUBSCRIPTION_TYPE"),
+            ("rateLimitTier", "CLAUDE_CODE_RATE_LIMIT_TIER"),
+        ] {
+            if let Some(value) = oauth[field].as_str() {
+                command.env(variable, value);
+            }
+        }
         if !history.is_empty() {
             let path = work.path().join("history.jsonl");
             std::fs::write(&path, history).map_err(|_| {
@@ -426,11 +553,13 @@ impl Provider for ClaudeProvider {
         let (sender, receiver) = mpsc::channel(16);
         let id = self.id.clone();
         let store = self.store.clone();
+        let provider = self.clone();
         self.workers.spawn(async move {
             let _work = work;
             let process = &mut child;
             let mut quota = HashMap::new();
             let quota_updates = &mut quota;
+            let callback_cancellation = cancellation.clone();
             let stream = async_stream::try_stream! {
             // The SDK control protocol exposes client functions without executing host code.
             write_message(&mut stdin, &json!({"type":"control_request","request_id":"proxy-init","request":{"subtype":"initialize","hooks":null}})).await?;
@@ -470,6 +599,15 @@ impl Provider for ClaudeProvider {
                         if let Some(last_content) = &last_content {
                         write_message(stdin.as_mut().ok_or_else(|| ProxyError::new(ErrorKind::Upstream, "Unexpected Claude initialization"))?, &json!({"type":"user","message":{"role":"user","content":last_content},"parent_tool_use_id":null,"session_id":""})).await?;
                         }
+                    }
+                    Some("control_request") if message["request"]["subtype"] == "oauth_token_refresh" => {
+                        let refreshed = provider.credentials(Some(&access_token), &callback_cancellation).await?;
+                        let replacement = refreshed.credentials["claudeAiOauth"]["accessToken"].as_str()
+                            .filter(|token| !token.is_empty())
+                            .ok_or_else(|| ProxyError::new(ErrorKind::UpstreamAuth, "Claude access token missing"))?;
+                        write_message(stdin.as_mut().ok_or_else(|| ProxyError::new(ErrorKind::Upstream, "Unexpected Claude refresh request"))?,
+                            &json!({"type":"control_response","response":{"subtype":"success","request_id":message["request_id"],"response":{"accessToken":replacement}}})).await?;
+                        access_token = replacement.to_owned();
                     }
                     Some("control_request") => {
                         let request = &message["request"];
@@ -597,7 +735,7 @@ impl Provider for ClaudeProvider {
                 }
             };
             drop(stream);
-            // Reap before reading auth files; even dropped streams must save rotation.
+            // Reap before removing the isolated request directory, including dropped streams.
             let stopped = match child.try_wait() {
                 Ok(Some(_)) => Ok(()),
                 Ok(None) => child.kill().await,
@@ -605,22 +743,6 @@ impl Provider for ClaudeProvider {
             };
             let saved = async {
                 stopped.map_err(|_| ProxyError::new(ErrorKind::Upstream, "Cannot stop Claude process"))?;
-                credentials.credentials = read_auth_json(&config_dir.join(".credentials.json"))?;
-                let updated = read_auth_json(&config_dir.join(".claude.json"))?;
-                if let Some(account) = updated.get("oauthAccount") {
-                    if !account.is_object() {
-                        return Err(ProxyError::new(ErrorKind::Persistence, "Invalid Claude account configuration"));
-                    }
-                    credentials.oauth_account = Some(account.clone());
-                }
-                if let Some(user_id) = updated.get("userID") {
-                    credentials.user_id = Some(user_id.as_str().ok_or_else(|| ProxyError::new(ErrorKind::Persistence, "Invalid Claude user configuration"))?.to_owned());
-                }
-                if let Some(onboarding) = updated.get("hasCompletedOnboarding") {
-                    credentials.has_completed_onboarding = onboarding.as_bool().ok_or_else(|| ProxyError::new(ErrorKind::Persistence, "Invalid Claude onboarding configuration"))?;
-                }
-                PgStore::save_claude_credentials(transaction, &id, &credentials).await?;
-                // Release the auth connection and retain rotation even if quota saving fails.
                 if !quota.is_empty() {
                     store.save_quota(&id, &quota.into_values().collect::<Vec<_>>()).await?;
                 }
@@ -645,31 +767,6 @@ impl Provider for ClaudeProvider {
             receiver,
         )))
     }
-}
-
-fn read_auth_json(path: &Path) -> Result<Value, ProxyError> {
-    let mut bytes = Vec::new();
-    std::fs::File::open(path)
-        .and_then(|file| file.take(1024 * 1024 + 1).read_to_end(&mut bytes))
-        .map_err(|_| {
-            ProxyError::new(ErrorKind::Persistence, "Cannot read Claude authentication")
-        })?;
-    if bytes.len() > 1024 * 1024 {
-        return Err(ProxyError::new(
-            ErrorKind::Persistence,
-            "Claude authentication file is too large",
-        ));
-    }
-    let value: Value = serde_json::from_slice(&bytes).map_err(|_| {
-        ProxyError::new(ErrorKind::Persistence, "Invalid Claude authentication JSON")
-    })?;
-    if !value.is_object() {
-        return Err(ProxyError::new(
-            ErrorKind::Persistence,
-            "Invalid Claude authentication document",
-        ));
-    }
-    Ok(value)
 }
 
 async fn write_message(stdin: &mut ChildStdin, message: &Value) -> Result<(), ProxyError> {

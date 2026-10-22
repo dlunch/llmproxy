@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use prometheus_client::{
     encoding::text::encode,
@@ -8,6 +8,42 @@ use prometheus_client::{
 
 use crate::core::Usage;
 
+const LATENCY_BUCKETS: [f64; 16] = [
+    0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0, 15.0, 30.0, 60.0, 180.0,
+    600.0,
+];
+
+#[derive(Clone, Copy)]
+pub enum Stage {
+    Authentication,
+    Routing,
+    CredentialRead,
+    CredentialLock,
+    CredentialRefresh,
+    MaintenanceCredentialLock,
+    MaintenanceCredentialRefresh,
+    ProviderSetup,
+    FirstText,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, prometheus_client::encoding::EncodeLabelSet)]
+struct StageLabel {
+    stage: &'static str,
+}
+
+pub struct StageTimer<'a> {
+    metrics: &'a Metrics,
+    stage: Stage,
+    started: Instant,
+}
+
+impl Drop for StageTimer<'_> {
+    fn drop(&mut self) {
+        self.metrics
+            .observe_stage(self.stage, self.started.elapsed());
+    }
+}
+
 pub struct Metrics {
     registry: Registry,
     requests: Family<Vec<(String, String)>, Counter>,
@@ -15,6 +51,7 @@ pub struct Metrics {
     active: Family<Vec<(String, String)>, Gauge>,
     tokens: Family<Vec<(String, String)>, Counter>,
     latency: Histogram,
+    stages: Family<StageLabel, Histogram>,
 }
 
 impl Default for Metrics {
@@ -24,7 +61,10 @@ impl Default for Metrics {
         let failures = Family::default();
         let active = Family::default();
         let tokens = Family::default();
-        let latency = Histogram::new([0.1, 0.5, 1.0, 5.0, 15.0, 30.0, 60.0, 180.0, 600.0]);
+        let latency = Histogram::new(LATENCY_BUCKETS);
+        let stages = Family::<StageLabel, Histogram>::new_with_constructor(|| {
+            Histogram::new(LATENCY_BUCKETS)
+        });
         registry.register(
             "llmproxy_requests",
             "Finalized inference requests",
@@ -47,8 +87,13 @@ impl Default for Metrics {
         );
         registry.register(
             "llmproxy_request_duration_seconds",
-            "Inference request duration",
+            "Admitted inference lifecycle from API handler entry through durable finalization",
             latency.clone(),
+        );
+        registry.register(
+            "llmproxy_stage_duration_seconds",
+            "Request stage duration; FirstText starts at API handler entry and other stages may overlap",
+            stages.clone(),
         );
         Self {
             registry,
@@ -57,11 +102,38 @@ impl Default for Metrics {
             active,
             tokens,
             latency,
+            stages,
         }
     }
 }
 
 impl Metrics {
+    pub fn time_stage(&self, stage: Stage) -> StageTimer<'_> {
+        StageTimer {
+            metrics: self,
+            stage,
+            started: Instant::now(),
+        }
+    }
+
+    pub fn observe_stage(&self, stage: Stage, elapsed: Duration) {
+        self.stages
+            .get_or_create(&StageLabel {
+                stage: match stage {
+                    Stage::Authentication => "authentication",
+                    Stage::Routing => "routing",
+                    Stage::CredentialRead => "credential_read",
+                    Stage::CredentialLock => "credential_lock",
+                    Stage::CredentialRefresh => "credential_refresh",
+                    Stage::MaintenanceCredentialLock => "maintenance_credential_lock",
+                    Stage::MaintenanceCredentialRefresh => "maintenance_credential_refresh",
+                    Stage::ProviderSetup => "provider_setup",
+                    Stage::FirstText => "first_text",
+                },
+            })
+            .observe(elapsed.as_secs_f64());
+    }
+
     pub fn started(&self, provider: &str) {
         self.active
             .get_or_create(&vec![("provider".into(), provider.into())])

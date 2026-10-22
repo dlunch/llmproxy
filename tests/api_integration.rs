@@ -50,6 +50,20 @@ impl Provider for FakeProvider {
                 "Unsupported provider option",
             ));
         }
+        if request
+            .messages
+            .iter()
+            .any(|message| message.content == "timed text")
+        {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            return Ok(Box::pin(async_stream::stream! {
+                yield Ok(ProviderEvent::TextDelta(String::new()));
+                yield Ok(ProviderEvent::Usage(Usage { input_tokens: 1, output_tokens: 1 }));
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                yield Ok(ProviderEvent::TextDelta("actual text".into()));
+                yield Ok(ProviderEvent::Finished(FinishReason::Stop));
+            }));
+        }
         let tool_call = request
             .messages
             .iter()
@@ -207,78 +221,232 @@ impl Provider for FakeProvider {
 }
 
 #[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL"]
+async fn latency_metrics_include_database_waits_and_first_nonempty_text() {
+    let fixture = Fixture::new().await;
+    for (table, endpoint, body) in [
+        (
+            "api_tokens",
+            "/v1/chat/completions",
+            json!({"model":"test","messages":[{"role":"user","content":"timed text"}],"stream":true}),
+        ),
+        (
+            "provider_models",
+            "/v1/responses",
+            json!({"model":"test","input":"timed text","stream":true}),
+        ),
+    ] {
+        let mut lock = fixture.pool.begin().await.unwrap();
+        sqlx::query(&format!("LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE"))
+            .execute(&mut *lock)
+            .await
+            .unwrap();
+        let ((status, response), ()) = tokio::join!(fixture.post(endpoint, body), async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT FROM pg_locks WHERE relation=$1::regclass AND NOT granted)")
+                            .bind(table).fetch_one(&fixture.pool).await.unwrap();
+                        if waiting { break; }
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                }).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            lock.commit().await.unwrap();
+        });
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert!(response.contains("actual text"));
+    }
+    let metrics = fixture.metrics.render().unwrap();
+    let value = |name: &str| -> f64 {
+        metrics
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix(name)
+                    .and_then(|tail| tail.strip_prefix(' '))
+            })
+            .unwrap_or_else(|| panic!("Missing {name}: {metrics}"))
+            .parse()
+            .unwrap()
+    };
+    for stage in ["authentication", "routing", "provider_setup", "first_text"] {
+        assert_eq!(
+            value(&format!(
+                "llmproxy_stage_duration_seconds_count{{stage=\"{stage}\"}}"
+            )),
+            2.0
+        );
+    }
+    assert!(value("llmproxy_stage_duration_seconds_sum{stage=\"authentication\"}") >= 0.08);
+    assert!(value("llmproxy_stage_duration_seconds_sum{stage=\"routing\"}") >= 0.08);
+    assert!(value("llmproxy_stage_duration_seconds_sum{stage=\"provider_setup\"}") >= 0.06);
+    let first_text = value("llmproxy_stage_duration_seconds_sum{stage=\"first_text\"}");
+    assert!(first_text >= 0.30, "{metrics}");
+    assert!(value("llmproxy_request_duration_seconds_sum") >= first_text);
+    assert_eq!(
+        value("llmproxy_stage_duration_seconds_bucket{le=\"0.025\",stage=\"provider_setup\"}"),
+        0.0
+    );
+
+    assert_eq!(
+        fixture
+            .post(
+                "/v1/responses",
+                json!({"model":"test","input":"setup error"})
+            )
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(fixture.post("/v1/responses", json!({"model":"test","input":"call tool","tools":[{"type":"function","name":"weather","parameters":{"type":"object"}}],"tool_choice":"required"})).await.0, StatusCode::OK);
+    assert_eq!(
+        fixture
+            .post_from(None, Some("Bearer invalid"), None)
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    let metrics = fixture.metrics.render().unwrap();
+    assert!(
+        metrics.contains("llmproxy_stage_duration_seconds_count{stage=\"authentication\"} 5"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("llmproxy_stage_duration_seconds_count{stage=\"provider_setup\"} 4"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("llmproxy_stage_duration_seconds_count{stage=\"first_text\"} 2"),
+        "{metrics}"
+    );
+    fixture.cleanup().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "manual release latency benchmark; requires TEST_DATABASE_URL"]
 async fn proxy_latency_benchmark() {
-    for concurrency in [1, 4] {
-        for (endpoint, streaming) in [
-            ("/v1/chat/completions", false),
-            ("/v1/chat/completions", true),
-            ("/v1/responses", false),
-            ("/v1/responses", true),
-        ] {
-            let fixture = Fixture::new().await;
-            let input = "a".repeat(128 * 1024);
-            let body = if endpoint == "/v1/chat/completions" {
-            json!({"model":"test","messages":[{"role":"user","content":input},{"role":"user","content":"benchmark"}],"stream":streaming})
-        } else {
-            json!({"model":"test","input":[{"role":"user","content":input},{"role":"user","content":"benchmark"}],"stream":streaming})
-        }.to_string();
-            let mut first = Vec::new();
-            let mut total = Vec::new();
-            for iteration in 0..105 {
-                let samples = futures_util::future::join_all((0..concurrency).map(|_| async {
-                    let request = Request::builder()
-                        .method("POST")
-                        .uri(endpoint)
-                        .header("authorization", format!("Bearer {}", fixture.token))
-                        .header("content-type", "application/json")
-                        .body(Body::from(body.clone()))
-                        .unwrap();
-                    let started = std::time::Instant::now();
-                    let response = fixture.app.clone().oneshot(request).await.unwrap();
-                    assert_eq!(response.status(), StatusCode::OK);
-                    let mut response_body = response.into_body();
-                    let frame = response_body.frame().await.unwrap().unwrap();
-                    let first_elapsed = started.elapsed();
-                    assert!(!frame.into_data().unwrap().is_empty());
-                    let remaining = response_body.collect().await.unwrap().to_bytes();
-                    let elapsed = started.elapsed();
-                    if streaming {
-                        assert!(std::str::from_utf8(&remaining).unwrap().contains(
-                            if endpoint == "/v1/chat/completions" {
-                                "[DONE]"
-                            } else {
-                                "response.completed"
-                            }
-                        ));
-                    }
-                    (
-                        first_elapsed.as_secs_f64() * 1000.0,
-                        elapsed.as_secs_f64() * 1000.0,
-                    )
-                }))
-                .await;
-                if iteration >= 5 {
-                    for (first_ms, total_ms) in samples {
-                        first.push(first_ms);
-                        total.push(total_ms);
-                    }
-                }
-                fixture.observed.lock().unwrap().clear();
-            }
-            first.sort_by(f64::total_cmp);
-            total.sort_by(f64::total_cmp);
-            println!(
-                "{endpoint} stream={streaming} concurrency={concurrency} n={} first_ms p50={:.3} p95={:.3} total_ms p50={:.3} p95={:.3}",
-                first.len(),
-                first[first.len() / 2],
-                first[first.len() * 95 / 100],
-                total[total.len() / 2],
-                total[total.len() * 95 / 100]
-            );
-            fixture.cleanup().await;
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let (writer, drain) = llmproxy::logging::writer(log.reopen().unwrap());
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::fmt()
+            .json()
+            .with_writer(writer)
+            .with_env_filter(tracing_subscriber::EnvFilter::new("llmproxy=info"))
+            .finish(),
+    )
+    .unwrap();
+    for (history, large) in [(0, false), (0, true), (100_000, false)] {
+        let fixture = Fixture::new().await;
+        for _ in 0..history / 250 {
+            sqlx::query("INSERT INTO requests(id,account_id,api_token_id,requested_model,provider_id,upstream_model,started_at,deadline_at,finished_at,outcome,input_tokens,output_tokens) SELECT gen_random_uuid(),$1,$2,'test',p.id,'upstream-test',now()-interval '1 day',now()-interval '1 day',now()-interval '1 day','succeeded',100+g,50+g FROM provider_instances p CROSS JOIN generate_series(1,250) g WHERE p.account_id=$1")
+                .bind(fixture.account_id).bind(fixture.token_id).execute(&fixture.pool).await.unwrap();
         }
+        sqlx::query("ANALYZE requests")
+            .execute(&fixture.pool)
+            .await
+            .unwrap();
+        for concurrency in [1, 4] {
+            for (endpoint, streaming) in [
+                ("/v1/chat/completions", false),
+                ("/v1/chat/completions", true),
+                ("/v1/responses", false),
+                ("/v1/responses", true),
+            ] {
+                let input = if large {
+                    "a".repeat(128 * 1024)
+                } else {
+                    "hello".into()
+                };
+                let scenario = if large { "benchmark" } else { "ordinary" };
+                let body = if endpoint == "/v1/chat/completions" {
+                    json!({"model":"test","messages":[{"role":"user","content":input},{"role":"user","content":scenario}],"stream":streaming})
+                } else {
+                    json!({"model":"test","input":[{"role":"user","content":input},{"role":"user","content":scenario}],"stream":streaming})
+                }.to_string();
+                let mut first = Vec::new();
+                let mut text = Vec::new();
+                let mut total = Vec::new();
+                let mut measured_elapsed = Duration::ZERO;
+                for iteration in 0..55 {
+                    let batch_started = std::time::Instant::now();
+                    let samples = futures_util::future::join_all((0..concurrency).map(|_| async {
+                        let request = Request::builder()
+                            .method("POST")
+                            .uri(endpoint)
+                            .header("authorization", format!("Bearer {}", fixture.token))
+                            .header("content-type", "application/json")
+                            .body(Body::from(body.clone()))
+                            .unwrap();
+                        let started = std::time::Instant::now();
+                        let response = fixture.app.clone().oneshot(request).await.unwrap();
+                        assert_eq!(response.status(), StatusCode::OK);
+                        let mut response_body = response.into_body();
+                        let mut first_frame = None;
+                        let mut first_text = None;
+                        let mut completed = !streaming;
+                        while let Some(frame) = response_body.frame().await {
+                            let bytes = frame.unwrap().into_data().unwrap();
+                            if bytes.is_empty() {
+                                continue;
+                            }
+                            let elapsed = started.elapsed();
+                            first_frame.get_or_insert(elapsed);
+                            if !streaming {
+                                first_text.get_or_insert(elapsed);
+                                continue;
+                            }
+                            for line in std::str::from_utf8(&bytes).unwrap().lines() {
+                                let Some(data) = line.strip_prefix("data: ") else {
+                                    continue;
+                                };
+                                if data == "[DONE]" {
+                                    completed = true;
+                                    continue;
+                                }
+                                let value: Value = serde_json::from_str(data).unwrap();
+                                completed |= value["type"] == "response.completed";
+                                if value["choices"][0]["delta"]["content"]
+                                    .as_str()
+                                    .is_some_and(|s| !s.is_empty())
+                                    || (value["type"] == "response.output_text.delta"
+                                        && value["delta"].as_str().is_some_and(|s| !s.is_empty()))
+                                {
+                                    first_text.get_or_insert(elapsed);
+                                }
+                            }
+                        }
+                        assert!(completed);
+                        (first_frame.unwrap(), first_text.unwrap(), started.elapsed())
+                    }))
+                    .await;
+                    if iteration >= 5 {
+                        measured_elapsed += batch_started.elapsed();
+                        for (frame_elapsed, text_elapsed, total_elapsed) in samples {
+                            first.push(frame_elapsed.as_secs_f64() * 1000.0);
+                            text.push(text_elapsed.as_secs_f64() * 1000.0);
+                            total.push(total_elapsed.as_secs_f64() * 1000.0);
+                        }
+                    }
+                    fixture.observed.lock().unwrap().clear();
+                }
+                first.sort_by(f64::total_cmp);
+                text.sort_by(f64::total_cmp);
+                total.sort_by(f64::total_cmp);
+                println!(
+                    "history={history} large={large} {endpoint} stream={streaming} concurrency={concurrency} n={} first_frame_ms p50={:.3} first_text_ms p50={:.3} p95={:.3} total_ms p50={:.3} p95={:.3} requests_per_second={:.1}",
+                    first.len(),
+                    first[first.len() / 2],
+                    text[text.len() / 2],
+                    text[text.len() * 95 / 100],
+                    total[total.len() / 2],
+                    total[total.len() * 95 / 100],
+                    total.len() as f64 / measured_elapsed.as_secs_f64()
+                );
+            }
+        }
+        fixture.cleanup().await;
     }
+    drain.finish().unwrap();
+    assert!(log.as_file().metadata().unwrap().len() > 0);
 }
 
 struct Fixture {
@@ -289,6 +457,7 @@ struct Fixture {
     token: String,
     token_id: Uuid,
     account_id: Uuid,
+    metrics: Arc<Metrics>,
     observed: Arc<Mutex<Vec<Vec<String>>>>,
 }
 
@@ -358,7 +527,7 @@ impl Fixture {
         let app = router(ApiState {
             gateway,
             store,
-            metrics,
+            metrics: metrics.clone(),
         });
         Self {
             app,
@@ -368,6 +537,7 @@ impl Fixture {
             token,
             token_id,
             account_id,
+            metrics,
             observed,
         }
     }
@@ -931,16 +1101,30 @@ impl std::io::Write for LogBuffer {
 #[tokio::test]
 #[ignore = "requires TEST_DATABASE_URL"]
 async fn json_logs_include_correlated_bodies_and_never_authentication_headers() {
+    // Isolate global tracing callsite interest from concurrently running API tests.
+    if std::env::var_os("LLMPROXY_LOG_TEST_CHILD").is_none() {
+        let status = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "json_logs_include_correlated_bodies_and_never_authentication_headers",
+                "--ignored",
+            ])
+            .env("LLMPROXY_LOG_TEST_CHILD", "1")
+            .status()
+            .await
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
     let fixture = Fixture::new().await;
     let logs = Arc::new(Mutex::new(Vec::new()));
-    let writer = LogBuffer(logs.clone());
+    let (writer, drain) = llmproxy::logging::writer(LogBuffer(logs.clone()));
     let subscriber = tracing_subscriber::fmt()
         .json()
         .without_time()
         .with_ansi(false)
-        .with_writer(move || writer.clone())
+        .with_writer(writer)
         .finish();
-    // Keep callsite interest stable while other integration tests emit events concurrently.
     tracing::subscriber::set_global_default(subscriber).unwrap();
     let (collected,chat_sse,response_sse) = async {
         let (status,collected) = fixture.post("/v1/chat/completions",json!({"model":"test","messages":[{"role":"user","content":"log input"}]})).await;
@@ -954,6 +1138,7 @@ async fn json_logs_include_correlated_bodies_and_never_authentication_headers() 
         assert_eq!(fixture.post_from(None,Some("Bearer secret-invalid-token"),None).await.0,StatusCode::UNAUTHORIZED);
         (collected,chat_sse,response_sse)
     }.await;
+    drain.finish().unwrap();
     let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
     assert!(!logs.contains(&fixture.token));
     assert!(!logs.contains("secret-invalid-token"));
