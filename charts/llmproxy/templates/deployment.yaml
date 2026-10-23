@@ -16,7 +16,7 @@ spec:
         app.kubernetes.io/name: llmproxy
         app.kubernetes.io/instance: {{ .Release.Name }}
       annotations:
-        checksum/config: {{ .Values.config | sha256sum }}
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
     spec:
       automountServiceAccountToken: false
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}

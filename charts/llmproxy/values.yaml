@@ -14,7 +14,19 @@ database:
 terminationGracePeriodSeconds: 180
 resources: {}
 
+dashboard:
+  image:
+    repository: ghcr.io/dlunch/llmproxy-dashboard
+    tag: latest
+    pullPolicy: Always
+  replicaCount: 2
+  resources: {}
+  # Public API and dashboard origins, including scheme, without trailing slash.
+  apiUrl: ""
+  origin: ""
+
 # Keep this listener: the Service and probes use port 8080.
+# dashboard.origin supplies dashboard_origin separately; do not repeat it here.
 config: |
   listen = "0.0.0.0:8080"
   max_concurrent_requests = 16

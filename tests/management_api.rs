@@ -118,7 +118,11 @@ impl Fixture {
                 metrics: metrics.clone(),
             })
         });
-        let app = router(ManagementState::new(store, oauth, true)).merge(api);
+        let app = router(
+            ManagementState::new(store, oauth, true),
+            Some("https://dashboard.example.test".parse().unwrap()),
+        )
+        .merge(api);
         Self {
             app,
             replica,
@@ -233,6 +237,86 @@ impl Fixture {
 #[ignore = "requires TEST_DATABASE_URL pointing to disposable PostgreSQL"]
 async fn signup_codes_password_sessions_and_account_isolation() {
     let fixture = Fixture::new().await;
+    for origin in [
+        "https://dashboard.example.test",
+        "https://untrusted.example.test",
+    ] {
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/management/providers")
+                    .header("origin", origin)
+                    .header("access-control-request-method", "POST")
+                    .header(
+                        "access-control-request-headers",
+                        "content-type,x-llmproxy-management",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        if origin == "https://dashboard.example.test" {
+            assert_eq!(response.headers()["access-control-allow-origin"], origin);
+            assert_eq!(
+                response.headers()["access-control-allow-credentials"],
+                "true"
+            );
+            assert!(
+                response.headers()["access-control-allow-headers"]
+                    .to_str()
+                    .unwrap()
+                    .contains("x-llmproxy-management")
+            );
+        } else {
+            assert!(
+                !response
+                    .headers()
+                    .contains_key("access-control-allow-origin")
+            );
+        }
+    }
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/management/account")
+                .header("origin", "https://dashboard.example.test")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response.headers()["access-control-allow-origin"],
+        "https://dashboard.example.test"
+    );
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::OPTIONS)
+                .uri("/v1/responses")
+                .header("origin", "https://dashboard.example.test")
+                .header("access-control-request-method", "POST")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !response
+            .headers()
+            .contains_key("access-control-allow-origin")
+    );
+
     let response = fixture
         .app
         .clone()

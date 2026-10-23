@@ -171,12 +171,11 @@ impl Fixture {
             CodexAuth::new(client.clone(), upstream_url.clone()),
             ClaudeAuth::new(client, format!("{upstream_url}/claude/token")),
         ));
-        let first = router(ManagementState::new(store, manager.clone(), false));
-        let second = router(ManagementState::new(
-            second_store,
-            other_manager.clone(),
-            false,
-        ));
+        let first = router(ManagementState::new(store, manager.clone(), false), None);
+        let second = router(
+            ManagementState::new(second_store, other_manager.clone(), false),
+            None,
+        );
         Self {
             admin,
             pool,

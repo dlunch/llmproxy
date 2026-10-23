@@ -186,7 +186,7 @@ async fn complete_browser_login(pool: &sqlx::PgPool, token_endpoint: &str) {
         CodexAuth::new(client.clone(), "http://127.0.0.1:1".into()),
         ClaudeAuth::new(client, token_endpoint.into()),
     ));
-    let app = router(ManagementState::new(store, manager.clone(), false));
+    let app = router(ManagementState::new(store, manager.clone(), false), None);
     let response = app
         .clone()
         .oneshot(

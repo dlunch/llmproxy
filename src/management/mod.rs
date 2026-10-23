@@ -6,13 +6,14 @@ use std::{collections::HashSet, sync::Arc};
 use axum::{
     Extension, Json, Router,
     extract::{DefaultBodyLimit, Path, State, rejection::JsonRejection},
-    http::StatusCode,
+    http::{HeaderName, HeaderValue, Method, StatusCode, header},
     middleware,
     routing::{delete, get, post},
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
+use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 
 use crate::{
@@ -45,7 +46,7 @@ impl ManagementState {
     }
 }
 
-pub fn router(state: ManagementState) -> Router {
+pub fn router(state: ManagementState, dashboard_origin: Option<HeaderValue>) -> Router {
     let authenticated = Router::new()
         .route("/session", delete(auth::logout))
         .route("/account", get(account).patch(update_account))
@@ -57,7 +58,7 @@ pub fn router(state: ManagementState) -> Router {
         .route("/routing", get(routing).put(replace_routing))
         .merge(oauth::router())
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::session));
-    Router::new()
+    let app = Router::new()
         .nest(
             "/management",
             Router::new()
@@ -67,7 +68,27 @@ pub fn router(state: ManagementState) -> Router {
                 .layer(middleware::from_fn(auth::management_headers))
                 .layer(DefaultBodyLimit::max(1024 * 1024)),
         )
-        .with_state(state)
+        .with_state(state);
+    if let Some(origin) = dashboard_origin {
+        app.layer(
+            CorsLayer::new()
+                .allow_origin([origin])
+                .allow_credentials(true)
+                .allow_methods([
+                    Method::GET,
+                    Method::POST,
+                    Method::PATCH,
+                    Method::PUT,
+                    Method::DELETE,
+                ])
+                .allow_headers([
+                    header::CONTENT_TYPE,
+                    HeaderName::from_static("x-llmproxy-management"),
+                ]),
+        )
+    } else {
+        app
+    }
 }
 
 pub(super) fn read_json<T>(body: Result<Json<T>, JsonRejection>) -> Result<T, ProxyError> {

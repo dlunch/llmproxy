@@ -5,3 +5,4 @@ metadata:
 data:
   config.toml: |
 {{ .Values.config | indent 4 }}
+    dashboard_origin = {{ required "dashboard.origin must be the public dashboard origin" .Values.dashboard.origin | toJson }}

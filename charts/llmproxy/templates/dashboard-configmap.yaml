@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-dashboard-config
+data:
+  config.json: |
+    {{ dict "apiUrl" (required "dashboard.apiUrl must be the public API origin" .Values.dashboard.apiUrl) | toJson }}

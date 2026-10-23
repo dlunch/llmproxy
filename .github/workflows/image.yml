@@ -1,4 +1,4 @@
-name: Container image
+name: Container images
 
 on:
   pull_request:
@@ -13,22 +13,29 @@ concurrency:
   group: image-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  IMAGE: ghcr.io/${{ github.repository }}
-
 jobs:
   build:
     strategy:
       fail-fast: false
       matrix:
+        product: [api, dashboard]
+        architecture: [amd64, arm64]
         include:
-          - platform: linux/amd64
+          - architecture: amd64
+            platform: linux/amd64
             runner: ubuntu-24.04
-            artifact: amd64
-          - platform: linux/arm64
+          - architecture: arm64
+            platform: linux/arm64
             runner: ubuntu-24.04-arm
-            artifact: arm64
+          - product: api
+            context: .
+            image_suffix: ""
+          - product: dashboard
+            context: ./dashboard
+            image_suffix: -dashboard
     runs-on: ${{ matrix.runner }}
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}${{ matrix.image_suffix }}
     permissions:
       contents: read
       packages: write
@@ -44,12 +51,12 @@ jobs:
       - uses: docker/build-push-action@v7
         id: build
         with:
-          context: .
+          context: ${{ matrix.context }}
           platforms: ${{ matrix.platform }}
           labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=${{ github.event_name == 'push' }}
-          cache-from: type=gha,scope=${{ matrix.artifact }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.artifact }}
+          cache-from: type=gha,scope=${{ matrix.product }}-${{ matrix.architecture }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.product }}-${{ matrix.architecture }}
       - name: Export digest
         if: github.event_name == 'push'
         env:
@@ -60,7 +67,7 @@ jobs:
       - uses: actions/upload-artifact@v7
         if: github.event_name == 'push'
         with:
-          name: digest-${{ matrix.artifact }}
+          name: digest-${{ matrix.product }}-${{ matrix.architecture }}
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
@@ -69,13 +76,22 @@ jobs:
     if: github.event_name == 'push'
     needs: build
     runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          - product: api
+            image_suffix: ""
+          - product: dashboard
+            image_suffix: -dashboard
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}${{ matrix.image_suffix }}
     permissions:
       packages: write
     steps:
       - uses: actions/download-artifact@v8
         with:
           path: /tmp/digests
-          pattern: digest-*
+          pattern: digest-${{ matrix.product }}-*
           merge-multiple: true
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4

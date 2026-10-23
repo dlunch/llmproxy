@@ -24,6 +24,7 @@ tempfile = "3"
 tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["codec", "rt"] }
 toml = "0.9"
+tower-http = { version = "0.6", features = ["cors"] }
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

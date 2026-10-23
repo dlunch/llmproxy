@@ -8,6 +8,7 @@ A Rust subscription-backed LLM proxy with separate API, gateway, and provider mo
 - Client-defined function calls/results and native web search where the provider supports them.
 - Accounts with multiple API tokens and IP CIDRs; PostgreSQL request metadata and token usage belong to the account.
 - Email/password management sessions, signup codes, provider login, routing configuration, and per-token metrics.
+- A Korean static dashboard served by a separate Nginx image, calling the API directly from the browser.
 - JSON request/response and operational logs on stdout; Prometheus at `/metrics` and liveness at `/health`.
 
 ## Run
@@ -26,9 +27,9 @@ The server defaults to `127.0.0.1:8080`. Operational endpoints share the listene
 
 ## Container and Kubernetes
 
-GitHub Actions publishes `ghcr.io/dlunch/llmproxy` for `linux/amd64` and `linux/arm64`, built on matching native runners. Pull requests build without publishing. Main pushes publish `latest` and `sha-<full-commit>`; `v*` tags publish the tag name and commit tag. Authentication uses the workflow's `GITHUB_TOKEN` with package write permission.
+GitHub Actions builds `ghcr.io/dlunch/llmproxy` and `ghcr.io/dlunch/llmproxy-dashboard` independently for `linux/amd64` and `linux/arm64`, on matching native runners. Pull requests build without publishing. Main pushes publish `latest` and `sha-<full-commit>` for both images; `v*` tags publish the tag name and commit tag. Authentication uses the workflow's `GITHUB_TOKEN` with package write permission.
 
-The image runs as UID/GID 1000 and bundles the unmodified official Claude Code binary. Each build resolves the official latest release and verifies its download against the official SHA-256 manifest. The remote version file participates in Docker's cache key, so a new release invalidates the download layer. Update Claude by rebuilding and deploying a new image. Subscription credentials remain in PostgreSQL. Use `listen = "0.0.0.0:8080"` in the mounted configuration and a database address reachable from the container:
+The API image runs as UID/GID 1000 and bundles the unmodified official Claude Code binary. Each build resolves the official latest release and verifies its download against the official SHA-256 manifest. The remote version file participates in Docker's cache key, so a new release invalidates the download layer. Update Claude by rebuilding and deploying a new image. Subscription credentials remain in PostgreSQL. Use `listen = "0.0.0.0:8080"` in the mounted configuration and a database address reachable from the container:
 
 ```sh
 docker run --rm -p 127.0.0.1:8080:8080 \
@@ -37,15 +38,28 @@ docker run --rm -p 127.0.0.1:8080:8080 \
   ghcr.io/dlunch/llmproxy:latest
 ```
 
-Build locally with `docker build -t llmproxy .`. For Kubernetes, create a database connection Secret using your usual Secret management process, then install the [Helm chart](charts/llmproxy/README.md):
+Build the API locally with `docker build -t llmproxy .`. The dashboard uses [unprivileged Nginx](https://github.com/nginx/docker-nginx-unprivileged) to serve only static files. For local development, keep the example API configuration's `dashboard_origin = "http://127.0.0.1:8081"` and `cookie_secure = false`, then run:
+
+```sh
+docker build -t llmproxy-dashboard ./dashboard
+docker run --rm --read-only --tmpfs /tmp \
+  -p 127.0.0.1:8081:8080 llmproxy-dashboard
+```
+
+Open `http://127.0.0.1:8081`. Its default `config.json` points directly to the API at `http://127.0.0.1:8080`. The dashboard supports signup/login, account settings, provider login/configuration, routing, and API tokens with usage statistics. Token secrets are shown once and are not saved in browser storage. To change the API address outside Helm, mount a `config.json` containing `{"apiUrl":"https://api.example.com"}` at `/usr/share/nginx/html/config.json`.
+
+For Kubernetes, create a database connection Secret using your usual Secret management process and choose two public origins under the same site. Set their actual addresses when installing the [Helm chart](charts/llmproxy/README.md); the following domains are examples:
 
 ```sh
 helm upgrade --install llmproxy ./charts/llmproxy \
   --set database.existingSecret=llmproxy-database \
-  --set image.tag='sha-<full-commit>'
+  --set dashboard.apiUrl=https://api.example.com \
+  --set dashboard.origin=https://dashboard.example.com \
+  --set image.tag='sha-<full-commit>' \
+  --set dashboard.image.tag='sha-<full-commit>'
 ```
 
-The chart supports multiple replicas and rolling updates. PostgreSQL row locks serialize credential refresh across replicas. The bundled executable requires no persistent volume or startup installer. See the [chart README](charts/llmproxy/README.md) for deployment and image pull settings.
+The chart creates separate API and dashboard Deployments and ClusterIP Services, each on port 8080. Route the API domain to the `llmproxy` Service and the dashboard domain to `llmproxy-dashboard` through your existing HTTPS routing. The API domain serves management, completion, and streaming requests; the browser calls it directly. Nginx does not proxy API traffic. Both deployments support multiple replicas and rolling updates. PostgreSQL row locks serialize credential refresh across API replicas; neither application needs persistent volumes or sticky sessions.
 
 ## Accounts and management API
 
@@ -72,7 +86,7 @@ curl http://127.0.0.1:8080/management/sessions \
 curl http://127.0.0.1:8080/management/account -b session.cookies
 ```
 
-Login sets a 24-hour HttpOnly, SameSite=Strict cookie scoped to `/management`; it does not issue an inference token. `cookie_secure` defaults to `true` and requires HTTPS. The example configuration disables it for local HTTP development. All management mutations, including signup and login, require `X-LLMProxy-Management: 1`. Management endpoints use the session cookie and are intended for same-origin clients; inference bearer tokens and IP CIDRs do not authenticate them.
+Login sets a 24-hour HttpOnly, SameSite=Strict cookie scoped to `/management`; it does not issue an inference token. `cookie_secure` defaults to `true` and requires HTTPS. The example configuration disables it for local HTTP development. All management mutations, including signup and login, require `X-LLMProxy-Management: 1`. Management CORS allows credentials from only the configured `dashboard_origin`; inference endpoints do not enable CORS. Use HTTPS sibling domains so the session cookie remains same-site. Inference bearer tokens and IP CIDRs do not authenticate management endpoints.
 
 Authenticated endpoints are scoped to the signed-in account. Prefix each path below with `/management` and send the session cookie:
 
@@ -210,7 +224,9 @@ The request-duration histogram starts at inference handler entry and ends after 
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --locked
-helm lint charts/llmproxy --set database.existingSecret=llmproxy-database
+helm lint charts/llmproxy --set database.existingSecret=llmproxy-database \
+  --set dashboard.apiUrl=https://api.example.com \
+  --set dashboard.origin=https://dashboard.example.com
 python3 tests/helm_chart.py
 # Use a disposable PostgreSQL database; tests isolate their tables in random schemas.
 export TEST_DATABASE_URL=postgres://user:password@127.0.0.1:5432/llmproxy_test
@@ -219,6 +235,8 @@ cargo test --locked -- --include-ignored --skip actual_cli_roundtrips --skip pro
 CLAUDE_TEST_EXECUTABLE=/absolute/path/to/claude \
   cargo test --locked --test claude_provider actual_cli_roundtrips -- --ignored
 ```
+
+For browser integration checks, install Playwright with Chromium in your test environment and run `node tests/dashboard.cjs` with `DASHBOARD_TEST_URL` and a fresh `DASHBOARD_SIGNUP_CODE`. Point the static site's `config.json` at a disposable API/database on a separate origin, and set that API's `dashboard_origin` accordingly. The test creates an account and exercises token, provider, routing, and session flows; OAuth UI responses use local fixtures. Set `DASHBOARD_SCREENSHOTS` to retain desktop/mobile screenshots.
 
 Subprocess fixtures require Python 3. Chart checks require Helm, Python 3.11+, and PyYAML. Database-dependent tests are explicitly ignored unless selected. The actual-Claude test requires both `TEST_DATABASE_URL` and `CLAUDE_TEST_EXECUTABLE`; it runs the executable against a fake local API and does not contact a real subscription account. Other provider tests use local HTTP/subprocess fixtures. See the QA report for the actual checks performed and account-dependent limitations. Replicas must use the same provider ID for a shared upstream credential so that PostgreSQL credential locks coordinate them.
 

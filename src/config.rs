@@ -10,6 +10,7 @@ pub struct Config {
     pub request_timeout_seconds: u64,
     pub claude_executable: PathBuf,
     pub cookie_secure: bool,
+    pub dashboard_origin: Option<String>,
 }
 
 impl Default for Config {
@@ -20,6 +21,7 @@ impl Default for Config {
             request_timeout_seconds: 120,
             claude_executable: "/usr/local/bin/claude".into(),
             cookie_secure: true,
+            dashboard_origin: None,
         }
     }
 }
@@ -36,6 +38,17 @@ impl Config {
         }
         if !self.claude_executable.is_absolute() {
             return Err("Claude executable must be an absolute path".into());
+        }
+        if let Some(origin) = &self.dashboard_origin {
+            let url = reqwest::Url::parse(origin).map_err(|_| "Invalid dashboard origin")?;
+            if !matches!(url.scheme(), "http" | "https")
+                || url.origin().ascii_serialization() != *origin
+            {
+                return Err(
+                    "dashboard_origin must be an HTTP(S) origin without a path or trailing slash"
+                        .into(),
+                );
+            }
         }
         Ok(())
     }

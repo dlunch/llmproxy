@@ -107,11 +107,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         store: store.clone(),
         metrics,
     })
-    .merge(llmproxy::management::router(ManagementState::new(
-        store.clone(),
-        oauth.clone(),
-        config.cookie_secure,
-    )));
+    .merge(llmproxy::management::router(
+        ManagementState::new(store.clone(), oauth.clone(), config.cookie_secure),
+        config
+            .dashboard_origin
+            .as_deref()
+            .map(str::parse)
+            .transpose()?,
+    ));
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let maintenance_stop = CancellationToken::new();
     let maintenance = tokio::spawn(maintain_credentials(

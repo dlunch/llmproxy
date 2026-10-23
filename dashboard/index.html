@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="description" content="llmproxy 계정, API 토큰, 제공자와 모델 경로를 관리합니다.">
+  <title>llmproxy · 관리 콘솔</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main-content">본문으로 이동</a>
+  <div id="boot" class="boot" role="status">관리 콘솔을 불러오고 있습니다.</div>
+
+  <main id="auth-screen" class="auth-screen" hidden>
+    <div class="auth-intro">
+      <a class="brand" href="/" aria-label="llmproxy 홈"><span class="brand-mark" aria-hidden="true">lp</span><span>llmproxy</span></a>
+      <div class="auth-copy"><p class="eyebrow">YOUR MODELS, ONE PLACE</p><h1>연결은 간단하게.<br>관리는 한곳에서.</h1><p>API 토큰부터 모델 연결, 사용량까지.<br>내 계정에 필요한 설정을 한눈에 확인하세요.</p></div>
+      <p class="auth-footnote">llmproxy 관리 콘솔</p>
+    </div>
+    <div class="auth-card">
+      <div class="auth-tabs" aria-label="계정 접속 방식">
+        <button type="button" id="login-tab" class="active" aria-pressed="true">로그인</button>
+        <button type="button" id="signup-tab" aria-pressed="false">계정 만들기</button>
+      </div>
+      <div id="auth-message" class="notice" role="status" hidden></div>
+      <form id="login-form">
+        <h2>다시 만나서 반갑습니다.</h2><p class="muted">이메일과 비밀번호로 로그인하세요.</p>
+        <label for="login-email">이메일</label><input id="login-email" name="email" type="email" autocomplete="username" maxlength="254" required placeholder="you@example.com">
+        <label for="login-password">비밀번호</label><input id="login-password" name="password" type="password" autocomplete="current-password" maxlength="1024" required>
+        <button type="submit" class="primary full">로그인</button>
+      </form>
+      <form id="signup-form" hidden>
+        <h2>내 워크스페이스를 시작하세요.</h2><p class="muted">관리자에게 받은 가입 코드가 필요합니다.</p>
+        <label for="signup-label">표시 이름</label><input id="signup-label" name="label" autocomplete="nickname" maxlength="256" required placeholder="내 워크스페이스">
+        <label for="signup-email">이메일</label><input id="signup-email" name="email" type="email" autocomplete="username" maxlength="254" required placeholder="you@example.com">
+        <label for="signup-password">비밀번호 <span class="label-hint">8바이트 이상</span></label><input id="signup-password" name="password" type="password" autocomplete="new-password" maxlength="1024" required>
+        <label for="signup-code">가입 코드</label><input id="signup-code" name="signup_code" class="mono" autocomplete="off" spellcheck="false" pattern="[0-9a-fA-F]{64}" minlength="64" maxlength="64" required aria-describedby="signup-code-help">
+        <p id="signup-code-help" class="field-help">64자리 가입 코드는 한 번만 사용할 수 있습니다.</p>
+        <button type="submit" class="primary full">계정 만들기</button>
+      </form>
+    </div>
+  </main>
+
+  <div id="app" class="app" hidden>
+    <aside class="sidebar">
+      <a class="brand" href="/" aria-label="llmproxy 홈"><span class="brand-mark" aria-hidden="true">lp</span><span>llmproxy</span></a>
+      <p class="sidebar-caption">WORKSPACE</p>
+      <nav aria-label="주요 메뉴">
+        <button type="button" data-view="overview" class="nav-item active" aria-current="page"><span aria-hidden="true">01</span>개요</button>
+        <button type="button" data-view="tokens" class="nav-item"><span aria-hidden="true">02</span>API 토큰</button>
+        <button type="button" data-view="providers" class="nav-item"><span aria-hidden="true">03</span>제공자</button>
+        <button type="button" data-view="routing" class="nav-item"><span aria-hidden="true">04</span>모델 경로</button>
+        <button type="button" data-view="account" class="nav-item"><span aria-hidden="true">05</span>계정</button>
+      </nav>
+      <div class="sidebar-account"><span id="account-avatar" class="avatar" aria-hidden="true"></span><div><strong id="sidebar-label"></strong><span id="sidebar-email"></span></div></div>
+    </aside>
+    <div class="workspace">
+      <header class="topbar"><div><span class="muted">워크스페이스</span><span class="breadcrumb" aria-hidden="true">/</span><span id="current-view">개요</span></div><div class="topbar-actions"><button type="button" id="refresh-button" class="quiet">새로 고침</button><button type="button" id="logout-button" class="quiet">로그아웃</button></div></header>
+      <main id="main-content" tabindex="-1">
+        <div id="global-message" class="notice" role="status" hidden></div>
+        <section id="view-overview" class="view" aria-labelledby="overview-title">
+          <div class="page-heading"><div><p class="eyebrow">OVERVIEW</p><h1 id="overview-title">서비스 현황</h1><p class="muted">내 계정의 연결 상태와 API 사용량을 확인하세요.</p></div><span id="updated-at" class="updated-at"></span></div>
+          <div class="summary-grid">
+            <article class="summary-card"><p>전체 요청</p><strong id="summary-requests">—</strong><span>API 토큰으로 접수한 요청</span></article>
+            <article class="summary-card"><p>입력 토큰</p><strong id="summary-input">—</strong><span>기록된 누적 사용량</span></article>
+            <article class="summary-card"><p>출력 토큰</p><strong id="summary-output">—</strong><span>기록된 누적 사용량</span></article>
+            <article class="summary-card accent-card"><p>연결된 제공자</p><strong id="summary-providers">—</strong><span>인증 정보가 저장된 제공자</span></article>
+          </div>
+          <div class="overview-grid">
+            <article class="panel"><div class="panel-heading"><h2>시작하기</h2><span class="badge neutral">계정 설정</span></div><div class="setup-list">
+              <button type="button" class="setup-item" data-view="providers"><span class="step">1</span><span><strong>제공자 연결</strong><small id="setup-providers">제공자를 등록하고 로그인하세요.</small></span><span aria-hidden="true">↗</span></button>
+              <button type="button" class="setup-item" data-view="routing"><span class="step">2</span><span><strong>모델 경로 설정</strong><small id="setup-routes">요청할 모델 이름과 제공자를 연결하세요.</small></span><span aria-hidden="true">↗</span></button>
+              <button type="button" class="setup-item" data-view="tokens"><span class="step">3</span><span><strong>API 토큰 발급</strong><small id="setup-tokens">앱에서 사용할 토큰을 만드세요.</small></span><span aria-hidden="true">↗</span></button>
+            </div></article>
+            <article class="panel"><div class="panel-heading"><h2>토큰별 요청</h2><button type="button" class="text-button" data-view="tokens">전체 보기 →</button></div><div id="overview-tokens" class="compact-list"></div><p class="panel-note">통계는 접수된 요청을 기준으로 집계합니다. 사용량이 반환되지 않은 요청은 토큰 합계에 포함되지 않습니다.</p></article>
+          </div>
+        </section>
+
+        <section id="view-tokens" class="view" aria-labelledby="tokens-title" hidden>
+          <div class="page-heading"><div><p class="eyebrow">API TOKENS</p><h1 id="tokens-title">API 토큰</h1><p class="muted">앱별로 토큰을 나누어 발급하고 사용량을 확인하세요.</p></div></div>
+          <article class="panel"><form id="token-form" class="inline-form"><div class="grow"><label for="token-label">새 토큰 이름</label><input id="token-label" name="label" maxlength="256" required placeholder="예: 개발 환경, 개인 앱"></div><button type="submit" class="primary">토큰 발급</button></form><p id="token-message" class="form-message" role="status" hidden></p></article>
+          <article class="panel table-panel"><div class="panel-heading"><h2>발급한 토큰</h2><span id="token-count" class="muted"></span></div><div id="token-list"></div></article>
+          <article id="token-metrics" class="panel" hidden><div class="panel-heading metrics-heading"><h2 id="metrics-title" tabindex="-1">토큰 사용량</h2><label class="sr-only" for="metrics-token">통계를 볼 토큰</label><select id="metrics-token"></select></div><div id="metrics-content"></div><p class="panel-note">평균 처리 시간은 완료된 요청의 접수부터 종료까지 걸린 시간입니다. 폐기한 토큰의 기록도 유지됩니다.</p></article>
+        </section>
+
+        <section id="view-providers" class="view" aria-labelledby="providers-title" hidden>
+          <div class="page-heading"><div><p class="eyebrow">PROVIDERS</p><h1 id="providers-title">제공자</h1><p class="muted">구독 계정을 연결하고 모델 요청에 사용할 제공자를 관리하세요.</p></div></div>
+          <article class="panel"><form id="provider-form" class="inline-form"><div><label for="provider-kind">유형</label><select id="provider-kind" name="kind"><option value="codex">Codex</option><option value="claude">Claude</option></select></div><div class="grow"><label for="provider-label">제공자 이름</label><input id="provider-label" name="label" maxlength="256" required placeholder="예: 개인 Claude 계정"></div><button type="submit" class="primary">제공자 등록</button></form><p id="provider-message" class="form-message" role="status" hidden></p></article>
+          <p class="section-note">‘인증 정보 저장됨’은 로그인 정보가 저장되어 있다는 뜻입니다. 현재 구독 상태나 사용 가능량을 보장하지는 않습니다.</p>
+          <div id="provider-list" class="provider-grid"></div>
+        </section>
+
+        <section id="view-routing" class="view" aria-labelledby="routing-title" hidden>
+          <div class="page-heading"><div><p class="eyebrow">MODEL ROUTING</p><h1 id="routing-title">모델 경로</h1><p class="muted">클라이언트에서 요청하는 모델 이름을 실제 제공자의 모델에 연결하세요.</p></div><span id="routing-dirty" class="badge warning" hidden>저장하지 않은 변경 사항</span></div>
+          <form id="routing-form" class="panel"><fieldset id="routing-fields"><div class="routing-settings"><div><label for="routing-strategy">제공자 선택 방식</label><select id="routing-strategy" name="strategy"><option value="least_used">누적 사용량이 적은 제공자 우선</option><option value="priority">우선순위가 높은 제공자 우선</option></select></div><p class="field-help">같은 모델 이름에 여러 제공자를 연결할 수 있습니다. 우선순위 방식에서는 숫자가 작은 경로를 먼저 선택합니다.</p></div><div id="route-list" class="route-list"></div><button type="button" id="add-route" class="secondary">+ 경로 추가</button><div class="form-footer"><p class="muted">모든 경로와 선택 방식을 한 번에 저장합니다.</p><button type="submit" class="primary">변경 사항 저장</button></div></fieldset><p id="routing-message" class="form-message" role="status" hidden></p></form>
+        </section>
+
+        <section id="view-account" class="view" aria-labelledby="account-title" hidden>
+          <div class="page-heading"><div><p class="eyebrow">ACCOUNT</p><h1 id="account-title">계정</h1><p class="muted">워크스페이스에서 사용할 표시 이름을 설정하세요.</p></div></div>
+          <article class="panel account-panel"><form id="account-form"><label for="account-label">표시 이름</label><input id="account-label" name="label" maxlength="256" required><label for="account-email">이메일</label><input id="account-email" type="email" readonly><dl class="account-details"><dt>가입일</dt><dd id="account-created"></dd></dl><button type="submit" class="primary">이름 저장</button><p id="account-message" class="form-message" role="status" hidden></p></form></article>
+        </section>
+      </main>
+      <footer class="workspace-footer"><span>llmproxy</span><span>내 계정의 모델을 하나의 API로.</span></footer>
+    </div>
+  </div>
+
+  <dialog id="token-dialog" aria-labelledby="token-dialog-title"><div class="dialog-heading"><h2 id="token-dialog-title">API 토큰이 발급되었습니다.</h2><button type="button" class="icon-button" data-close="token-dialog" aria-label="토큰 창 닫기">×</button></div><p class="muted">토큰은 이 창에서만 확인할 수 있습니다. 닫기 전에 안전한 곳에 복사해 두세요.</p><label for="issued-token">발급된 API 토큰</label><textarea id="issued-token" class="mono secret" readonly rows="3" spellcheck="false"></textarea><p id="copy-message" class="form-message" role="status" hidden></p><div class="dialog-actions"><button type="button" id="copy-token" class="secondary">토큰 복사</button><button type="button" class="primary" data-close="token-dialog">확인했어요</button></div></dialog>
+
+  <dialog id="oauth-dialog" aria-labelledby="oauth-title"><div class="dialog-heading"><h2 id="oauth-title">제공자 로그인</h2><button type="button" class="icon-button" data-close="oauth-dialog" aria-label="로그인 창 닫기">×</button></div><p id="oauth-description" class="muted"></p><div id="oauth-message" class="notice" role="status" hidden></div><div id="oauth-link-section" hidden><a id="oauth-link" class="button primary full" target="_blank" rel="noopener noreferrer">브라우저에서 로그인 ↗</a><p id="oauth-expiry" class="field-help"></p></div><div id="device-section" class="device-section" hidden><p class="muted">열린 페이지에 아래 코드를 입력하세요.</p><strong id="device-code" class="device-code mono"></strong><p id="device-status" class="field-help" role="status">인증 완료를 기다리고 있습니다.</p></div><form id="oauth-code-form" hidden><label for="oauth-code">로그인 페이지에 표시된 전체 코드</label><textarea id="oauth-code" name="code" rows="3" maxlength="8192" required autocomplete="off" spellcheck="false" placeholder="code#state"></textarea><p class="field-help">코드 뒤의 #과 나머지 문자열까지 모두 붙여 넣으세요.</p><button type="submit" class="primary full">인증 완료</button></form><div class="dialog-actions"><button type="button" id="oauth-retry" class="secondary" hidden>상태 다시 확인</button><button type="button" id="oauth-restart" class="secondary" hidden>새 로그인 시작</button><button type="button" class="quiet" data-close="oauth-dialog">닫기</button></div></dialog>
+  <noscript><p class="noscript">관리 콘솔을 사용하려면 JavaScript를 활성화해 주세요.</p></noscript>
+</body>
+</html>

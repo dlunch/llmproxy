@@ -2,6 +2,7 @@
 
 | Date | Task | Details |
 |---|---|---|
+| 2026-10-23 | Static account dashboard | [Implementation and verification](20261023-management-dashboard.md) |
 | 2026-10-23 | Account management and dynamic providers | [Implementation and verification](20261023-management-api.md) |
 | 2026-10-22 | Routing and streaming p50 follow-up | [Implementation and measurements](20261022-p50-latency.md) |
 | 2026-10-22 | Bounded usage reads and concurrent providers | [Implementation and measurements](20261022-latency-and-concurrency.md) |
