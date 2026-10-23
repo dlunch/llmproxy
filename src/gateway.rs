@@ -15,8 +15,8 @@ use uuid::Uuid;
 pub use crate::store::{ProviderState, QuotaWindow};
 use crate::{
     core::{
-        AccountUsage, Credential, ErrorKind, InferenceRequest, Principal, Provider, ProviderEvent,
-        ProxyError, Usage,
+        Credential, ErrorKind, InferenceRequest, Principal, Provider, ProviderEvent, ProviderKind,
+        ProxyError, RoutingContext, RoutingStrategy, Usage,
     },
     metrics::{Metrics, Stage},
     store::{NewRequest, PgStore},
@@ -28,19 +28,19 @@ pub trait RoutingPolicy: Send + Sync {
     fn select(
         &self,
         request: &InferenceRequest,
-        account: &AccountUsage,
+        context: &RoutingContext,
         routes: &[Route],
         states: &[ProviderState],
     ) -> Result<usize, ProxyError>;
 }
 
-pub struct LeastUsedPolicy;
+pub struct ConfiguredPolicy;
 
-impl RoutingPolicy for LeastUsedPolicy {
+impl RoutingPolicy for ConfiguredPolicy {
     fn select(
         &self,
         request: &InferenceRequest,
-        _account: &AccountUsage,
+        context: &RoutingContext,
         routes: &[Route],
         states: &[ProviderState],
     ) -> Result<usize, ProxyError> {
@@ -64,13 +64,23 @@ impl RoutingPolicy for LeastUsedPolicy {
                         && window.resets_at.is_none_or(|reset| reset > now)
                 });
                 if !exhausted
-                    && selected.is_none_or(|(previous_index, previous)| {
-                        (state.accumulated_tokens, &state.provider_id, index)
-                            < (
-                                previous.accumulated_tokens,
-                                &previous.provider_id,
-                                previous_index,
-                            )
+                    && selected.is_none_or(|(previous_index, previous)| match context.strategy {
+                        RoutingStrategy::LeastUsed => {
+                            (state.accumulated_tokens, &state.provider_id, index)
+                                < (
+                                    previous.accumulated_tokens,
+                                    &previous.provider_id,
+                                    previous_index,
+                                )
+                        }
+                        RoutingStrategy::Priority => {
+                            (route.priority, &state.provider_id, index)
+                                < (
+                                    routes[previous_index].priority,
+                                    &previous.provider_id,
+                                    previous_index,
+                                )
+                        }
                     })
                 {
                     selected = Some((index, state));
@@ -109,8 +119,7 @@ impl Drop for GatewayStream {
 
 pub struct Gateway {
     store: PgStore,
-    providers: HashMap<String, Arc<dyn Provider>>,
-    provider_ids: Vec<String>,
+    providers: HashMap<ProviderKind, Arc<dyn Provider>>,
     policy: Arc<dyn RoutingPolicy>,
     metrics: Arc<Metrics>,
     concurrency: Arc<Semaphore>,
@@ -121,18 +130,15 @@ pub struct Gateway {
 impl Gateway {
     pub fn new(
         store: PgStore,
-        providers: HashMap<String, Arc<dyn Provider>>,
+        providers: HashMap<ProviderKind, Arc<dyn Provider>>,
         policy: Arc<dyn RoutingPolicy>,
         metrics: Arc<Metrics>,
         max_concurrent: usize,
         timeout: Duration,
     ) -> Self {
-        let mut provider_ids: Vec<_> = providers.keys().cloned().collect();
-        provider_ids.sort();
         Self {
             store,
             providers,
-            provider_ids,
             policy,
             metrics,
             concurrency: Arc::new(Semaphore::new(max_concurrent)),
@@ -151,21 +157,17 @@ impl Gateway {
             ProxyError::new(ErrorKind::Unavailable, "Proxy concurrency limit reached")
         })?;
         let routing_timer = self.metrics.time_stage(Stage::Routing);
-        let (states, mut routes, account_usage) = tokio::try_join!(
+        let (states, (context, mut routes)) = tokio::try_join!(
+            self.store.provider_states(principal.account_id),
             self.store
-                .provider_states(principal.account_id, &self.provider_ids),
-            self.store
-                .provider_routes(principal.account_id, &self.provider_ids),
-            self.store.account_usage(principal.account_id),
+                .routing_snapshot(principal.account_id, &request.model),
         )?;
-        let selected = self
-            .policy
-            .select(&request, &account_usage, &routes, &states)?;
+        let selected = self.policy.select(&request, &context, &routes, &states)?;
         let route = routes.swap_remove(selected);
         drop(routing_timer);
         let provider = self
             .providers
-            .get(&route.provider_id)
+            .get(&route.provider_kind)
             .ok_or_else(|| ProxyError::new(ErrorKind::Unavailable, "Provider unavailable"))?
             .clone();
         let created_at = Utc::now();
@@ -196,7 +198,7 @@ impl Gateway {
         let (sender, receiver) = mpsc::channel(16);
         let cancellation = CancellationToken::new();
         let task_cancellation = cancellation.clone();
-        metrics.started(&provider_id);
+        metrics.started(&provider_id, token_id);
         self.tasks.spawn(async move {
             let _permit = permit;
             let mut usage = None;
@@ -211,7 +213,7 @@ impl Gateway {
                     biased;
                     _ = &mut cancelled => return Err(ProxyError::new(ErrorKind::Cancelled, "Request cancelled")),
                     _ = &mut timed_out => return Err(ProxyError::new(ErrorKind::Timeout, "Request timed out")),
-                    result = provider.infer(request, task_cancellation.clone()) => result?,
+                    result = provider.infer(&provider_id, request, task_cancellation.clone()) => result?,
                 };
                 drop(preparation_timer);
                 loop {
@@ -299,6 +301,7 @@ impl Gateway {
             };
             metrics.finished(
                 &provider_id,
+                token_id,
                 metric_outcome,
                 started.elapsed(),
                 usage.as_ref(),

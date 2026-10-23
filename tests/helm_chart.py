@@ -20,8 +20,7 @@ for custom_config in (False, True):
             "replicaCount": 3,
             "imagePullSecrets": [{"name": "ghcr"}],
             "config": 'listen = "0.0.0.0:8080"\nrequest_timeout_seconds = 120\n'
-            '[[providers]]\nkind = "claude"\nid = "claude-secondary"\n'
-            'executable = "/usr/local/bin/claude"\n',
+            'claude_executable = "/opt/claude"\ncookie_secure = false\n',
         })
     with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml") as file:
         yaml.safe_dump(values, file)
@@ -50,12 +49,9 @@ for custom_config in (False, True):
     volumes = {item["name"]: item for item in pod["volumes"]}
     assert volumes["config"]["configMap"]["name"] == manifests["ConfigMap"]["metadata"]["name"]
     assert volumes["tmp"]["emptyDir"] == {}
-    providers = {item["id"]: item for item in config["providers"]}
+    assert "providers" not in config
+    assert config["cookie_secure"] is not custom_config
+    assert config["claude_executable"] == ("/opt/claude" if custom_config else "/usr/local/bin/claude")
     if custom_config:
-        assert set(providers) == {"claude-secondary"}
         assert pod["imagePullSecrets"] == [{"name": "ghcr"}]
-    else:
-        assert set(providers) == {"codex-main", "claude-main"}
-    claude = next(item for item in providers.values() if item["kind"] == "claude")
-    assert claude["executable"] == "/usr/local/bin/claude"
 print("Helm render checks passed (bundled Claude and multiple replicas)")

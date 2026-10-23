@@ -18,7 +18,7 @@ use llmproxy::{
         ErrorKind, EventStream, FinishReason, InferenceRequest, Provider, ProviderEvent,
         ProxyError, Role, Tool, ToolChoice, Usage, WebSearchStatus,
     },
-    gateway::{Gateway, LeastUsedPolicy},
+    gateway::{ConfiguredPolicy, Gateway},
     metrics::Metrics,
     store::PgStore,
 };
@@ -37,6 +37,7 @@ struct FakeProvider {
 impl Provider for FakeProvider {
     async fn infer(
         &self,
+        _: &str,
         request: InferenceRequest,
         _: CancellationToken,
     ) -> Result<EventStream, ProxyError> {
@@ -281,7 +282,16 @@ async fn latency_metrics_include_database_waits_and_first_nonempty_text() {
     assert!(value("llmproxy_stage_duration_seconds_sum{stage=\"provider_setup\"}") >= 0.06);
     let first_text = value("llmproxy_stage_duration_seconds_sum{stage=\"first_text\"}");
     assert!(first_text >= 0.30, "{metrics}");
-    assert!(value("llmproxy_request_duration_seconds_sum") >= first_text);
+    let total_duration: f64 = metrics
+        .lines()
+        .find(|line| line.starts_with("llmproxy_request_duration_seconds_sum{"))
+        .unwrap()
+        .rsplit_once(' ')
+        .unwrap()
+        .1
+        .parse()
+        .unwrap();
+    assert!(total_duration >= first_text);
     assert_eq!(
         value("llmproxy_stage_duration_seconds_bucket{le=\"0.025\",stage=\"provider_setup\"}"),
         0.0
@@ -503,7 +513,7 @@ impl Fixture {
         .await
         .unwrap();
         let provider_id = Uuid::new_v4().to_string();
-        sqlx::query("INSERT INTO provider_instances(id,account_id) VALUES($1,$2)")
+        sqlx::query("INSERT INTO provider_instances(id,account_id,kind,label) VALUES($1,$2,'codex','Fixture')")
             .bind(&provider_id)
             .bind(account_id)
             .execute(&pool)
@@ -518,8 +528,8 @@ impl Fixture {
         let metrics = Arc::new(Metrics::default());
         let gateway = Arc::new(Gateway::new(
             store.clone(),
-            HashMap::from([(provider_id.clone(), provider)]),
-            Arc::new(LeastUsedPolicy),
+            HashMap::from([(llmproxy::core::ProviderKind::Codex, provider)]),
+            Arc::new(ConfiguredPolicy),
             metrics.clone(),
             4,
             Duration::from_secs(10),

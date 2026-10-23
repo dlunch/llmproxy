@@ -2,7 +2,13 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Postgres, QueryBuilder, Row, Transaction};
 use uuid::Uuid;
 
-use crate::core::{AccountUsage, Credential, ErrorKind, Principal, ProxyError, Usage};
+pub mod management;
+pub(crate) mod oauth;
+
+use crate::core::{
+    AccountUsage, Credential, ErrorKind, Principal, ProviderKind, ProxyError, Route,
+    RoutingContext, Usage,
+};
 
 #[derive(Clone)]
 pub struct PgStore {
@@ -16,6 +22,7 @@ pub struct CodexCredentials {
     pub account_id: String,
     pub expires_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
+    pub login_generation: i64,
 }
 
 #[derive(sqlx::FromRow)]
@@ -25,6 +32,7 @@ pub struct ClaudeCredentials {
     pub user_id: Option<String>,
     pub has_completed_onboarding: bool,
     pub updated_at: DateTime<Utc>,
+    pub login_generation: i64,
 }
 
 pub struct QuotaWindow {
@@ -92,19 +100,6 @@ impl PgStore {
         }))
     }
 
-    pub async fn account_usage(&self, account_id: Uuid) -> Result<AccountUsage, ProxyError> {
-        let (input, output): (i64, i64) =
-            sqlx::query_as("SELECT input_tokens,output_tokens FROM accounts WHERE id=$1")
-                .bind(account_id)
-                .fetch_one(&self.pool)
-                .await?;
-        Ok(AccountUsage {
-            account_id,
-            input_tokens: input as u64,
-            output_tokens: output as u64,
-        })
-    }
-
     pub async fn begin_request(&self, request: NewRequest<'_>) -> Result<(), ProxyError> {
         sqlx::query("INSERT INTO requests (id,api_token_id,requested_model,provider_id,upstream_model,started_at,deadline_at,client_ip,account_id,ip_range_id,outcome) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'running')")
             .bind(request.id).bind(request.token_id).bind(request.requested_model)
@@ -145,30 +140,45 @@ impl PgStore {
         Ok(())
     }
 
-    pub async fn provider_routes(
+    pub async fn routing_snapshot(
         &self,
         account_id: Uuid,
-        provider_ids: &[String],
-    ) -> Result<Vec<crate::core::Route>, ProxyError> {
-        let rows: Vec<(String, String, String)> = sqlx::query_as("SELECT m.model,m.provider_id,m.upstream_model FROM provider_models m JOIN provider_instances p ON p.id=m.provider_id WHERE p.account_id=$1 AND p.id=ANY($2) ORDER BY m.model,m.provider_id")
-            .bind(account_id).bind(provider_ids).fetch_all(&self.pool).await?;
-        Ok(rows
-            .into_iter()
-            .map(|(model, provider_id, upstream_model)| crate::core::Route {
-                model,
-                provider_id,
-                upstream_model,
-            })
-            .collect())
+        model: &str,
+    ) -> Result<(RoutingContext, Vec<Route>), ProxyError> {
+        let rows = sqlx::query("SELECT a.input_tokens,a.output_tokens,a.routing_strategy,m.model,m.provider_id,m.upstream_model,m.priority,p.kind FROM accounts a LEFT JOIN (provider_instances p JOIN provider_models m ON m.provider_id=p.id AND m.model=$2) ON p.account_id=a.id AND p.enabled AND p.kind IS NOT NULL WHERE a.id=$1 AND a.enabled ORDER BY m.provider_id")
+            .bind(account_id).bind(model).fetch_all(&self.pool).await?;
+        let first = rows
+            .first()
+            .ok_or_else(|| ProxyError::new(ErrorKind::Unauthorized, "Account unavailable"))?;
+        let context = RoutingContext {
+            usage: AccountUsage {
+                account_id,
+                input_tokens: first.try_get::<i64, _>("input_tokens")? as u64,
+                output_tokens: first.try_get::<i64, _>("output_tokens")? as u64,
+            },
+            strategy: first.try_get("routing_strategy")?,
+        };
+        let mut routes = Vec::with_capacity(rows.len());
+        for row in rows {
+            if let Some(provider_id) = row.try_get::<Option<String>, _>("provider_id")? {
+                routes.push(Route {
+                    model: row.try_get("model")?,
+                    provider_id,
+                    provider_kind: row.try_get("kind")?,
+                    upstream_model: row.try_get("upstream_model")?,
+                    priority: row.try_get("priority")?,
+                });
+            }
+        }
+        Ok((context, routes))
     }
 
     pub async fn provider_states(
         &self,
         account_id: Uuid,
-        provider_ids: &[String],
     ) -> Result<Vec<ProviderState>, ProxyError> {
-        let rows = sqlx::query("SELECT p.id,p.input_tokens + p.output_tokens AS accumulated_tokens,q.window_key,q.observed_at,q.remaining_fraction,q.resets_at FROM provider_instances p LEFT JOIN provider_quota q ON q.provider_id=p.id WHERE p.account_id=$1 AND p.id=ANY($2) ORDER BY p.id")
-            .bind(account_id).bind(provider_ids).fetch_all(&self.pool).await?;
+        let rows = sqlx::query("SELECT p.id,p.input_tokens + p.output_tokens AS accumulated_tokens,q.window_key,q.observed_at,q.remaining_fraction,q.resets_at FROM provider_instances p LEFT JOIN provider_quota q ON q.provider_id=p.id AND q.login_generation=p.login_generation WHERE p.account_id=$1 AND p.enabled AND p.kind IS NOT NULL ORDER BY p.id")
+            .bind(account_id).fetch_all(&self.pool).await?;
         let mut states = Vec::<ProviderState>::new();
         for row in rows {
             let provider: &str = row.try_get("id")?;
@@ -198,11 +208,16 @@ impl PgStore {
         Ok(states)
     }
 
+    pub async fn enabled_providers(&self) -> Result<Vec<(String, ProviderKind)>, ProxyError> {
+        Ok(sqlx::query_as("SELECT p.id,p.kind FROM provider_instances p JOIN accounts a ON a.id=p.account_id WHERE p.enabled AND a.enabled AND p.kind IS NOT NULL ORDER BY p.id")
+            .fetch_all(&self.pool).await?)
+    }
+
     pub async fn codex_credentials(
         &self,
         provider_id: &str,
     ) -> Result<CodexCredentials, ProxyError> {
-        sqlx::query_as("SELECT access_token,refresh_token,account_id,expires_at,updated_at FROM provider_credentials WHERE provider_id=$1")
+        sqlx::query_as("SELECT c.access_token,c.refresh_token,c.account_id,c.expires_at,c.updated_at,p.login_generation FROM provider_credentials c JOIN provider_instances p ON p.id=c.provider_id WHERE c.provider_id=$1")
             .bind(provider_id).fetch_optional(&self.pool).await?
             .ok_or_else(|| ProxyError::new(ErrorKind::UpstreamAuth, "Codex credentials unavailable"))
     }
@@ -212,9 +227,23 @@ impl PgStore {
         provider_id: &str,
     ) -> Result<(Transaction<'static, Postgres>, CodexCredentials), ProxyError> {
         let mut transaction = self.pool.begin().await?;
-        let credentials = sqlx::query_as("SELECT access_token,refresh_token,account_id,expires_at,updated_at FROM provider_credentials WHERE provider_id=$1 FOR UPDATE")
+        let row = sqlx::query("SELECT access_token,refresh_token,account_id,expires_at,updated_at FROM provider_credentials WHERE provider_id=$1 FOR UPDATE")
             .bind(provider_id).fetch_optional(&mut *transaction).await?
             .ok_or_else(|| ProxyError::new(ErrorKind::UpstreamAuth, "Codex credentials unavailable"))?;
+        // Read after locking: a joined locking SELECT can mix a new credential with an old generation.
+        let login_generation =
+            sqlx::query_scalar("SELECT login_generation FROM provider_instances WHERE id=$1")
+                .bind(provider_id)
+                .fetch_one(&mut *transaction)
+                .await?;
+        let credentials = CodexCredentials {
+            access_token: row.try_get("access_token")?,
+            refresh_token: row.try_get("refresh_token")?,
+            account_id: row.try_get("account_id")?,
+            expires_at: row.try_get("expires_at")?,
+            updated_at: row.try_get("updated_at")?,
+            login_generation,
+        };
         Ok((transaction, credentials))
     }
 
@@ -223,9 +252,25 @@ impl PgStore {
         provider_id: &str,
     ) -> Result<Option<(Transaction<'static, Postgres>, CodexCredentials)>, ProxyError> {
         let mut transaction = self.pool.begin().await?;
-        let credentials = sqlx::query_as("SELECT c.access_token,c.refresh_token,c.account_id,c.expires_at,c.updated_at FROM provider_credentials c JOIN provider_instances p ON p.id=c.provider_id JOIN accounts a ON a.id=p.account_id WHERE c.provider_id=$1 AND a.enabled AND c.refresh_token<>'' FOR UPDATE OF c SKIP LOCKED")
+        let row = sqlx::query("SELECT c.access_token,c.refresh_token,c.account_id,c.expires_at,c.updated_at FROM provider_credentials c JOIN provider_instances p ON p.id=c.provider_id JOIN accounts a ON a.id=p.account_id WHERE c.provider_id=$1 AND p.enabled AND a.enabled AND c.refresh_token<>'' FOR UPDATE OF c SKIP LOCKED")
             .bind(provider_id).fetch_optional(&mut *transaction).await?;
-        Ok(credentials.map(|credentials| (transaction, credentials)))
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let login_generation =
+            sqlx::query_scalar("SELECT login_generation FROM provider_instances WHERE id=$1")
+                .bind(provider_id)
+                .fetch_one(&mut *transaction)
+                .await?;
+        let credentials = CodexCredentials {
+            access_token: row.try_get("access_token")?,
+            refresh_token: row.try_get("refresh_token")?,
+            account_id: row.try_get("account_id")?,
+            expires_at: row.try_get("expires_at")?,
+            updated_at: row.try_get("updated_at")?,
+            login_generation,
+        };
+        Ok(Some((transaction, credentials)))
     }
 
     pub async fn save_codex_credentials(
@@ -244,7 +289,7 @@ impl PgStore {
         &self,
         provider_id: &str,
     ) -> Result<ClaudeCredentials, ProxyError> {
-        sqlx::query_as("SELECT credentials,oauth_account,user_id,has_completed_onboarding,updated_at FROM claude_credentials WHERE provider_id=$1")
+        sqlx::query_as("SELECT c.credentials,c.oauth_account,c.user_id,c.has_completed_onboarding,c.updated_at,p.login_generation FROM claude_credentials c JOIN provider_instances p ON p.id=c.provider_id WHERE c.provider_id=$1")
             .bind(provider_id).fetch_optional(&self.pool).await?
             .ok_or_else(|| ProxyError::new(ErrorKind::UpstreamAuth, "Claude subscription credentials are not configured"))
     }
@@ -254,9 +299,22 @@ impl PgStore {
         provider_id: &str,
     ) -> Result<(Transaction<'static, Postgres>, ClaudeCredentials), ProxyError> {
         let mut transaction = self.pool.begin().await?;
-        let credentials = sqlx::query_as("SELECT credentials,oauth_account,user_id,has_completed_onboarding,updated_at FROM claude_credentials WHERE provider_id=$1 FOR UPDATE")
+        let row = sqlx::query("SELECT credentials,oauth_account,user_id,has_completed_onboarding,updated_at FROM claude_credentials WHERE provider_id=$1 FOR UPDATE")
             .bind(provider_id).fetch_optional(&mut *transaction).await?
             .ok_or_else(|| ProxyError::new(ErrorKind::UpstreamAuth, "Claude subscription credentials are not configured"))?;
+        let login_generation =
+            sqlx::query_scalar("SELECT login_generation FROM provider_instances WHERE id=$1")
+                .bind(provider_id)
+                .fetch_one(&mut *transaction)
+                .await?;
+        let credentials = ClaudeCredentials {
+            credentials: row.try_get("credentials")?,
+            oauth_account: row.try_get("oauth_account")?,
+            user_id: row.try_get("user_id")?,
+            has_completed_onboarding: row.try_get("has_completed_onboarding")?,
+            updated_at: row.try_get("updated_at")?,
+            login_generation,
+        };
         Ok((transaction, credentials))
     }
 
@@ -265,9 +323,25 @@ impl PgStore {
         provider_id: &str,
     ) -> Result<Option<(Transaction<'static, Postgres>, ClaudeCredentials)>, ProxyError> {
         let mut transaction = self.pool.begin().await?;
-        let credentials = sqlx::query_as("SELECT c.credentials,c.oauth_account,c.user_id,c.has_completed_onboarding,c.updated_at FROM claude_credentials c JOIN provider_instances p ON p.id=c.provider_id JOIN accounts a ON a.id=p.account_id WHERE c.provider_id=$1 AND a.enabled AND NULLIF(c.credentials #>> '{claudeAiOauth,refreshToken}','') IS NOT NULL FOR UPDATE OF c SKIP LOCKED")
+        let row = sqlx::query("SELECT c.credentials,c.oauth_account,c.user_id,c.has_completed_onboarding,c.updated_at FROM claude_credentials c JOIN provider_instances p ON p.id=c.provider_id JOIN accounts a ON a.id=p.account_id WHERE c.provider_id=$1 AND p.enabled AND a.enabled AND NULLIF(c.credentials #>> '{claudeAiOauth,refreshToken}','') IS NOT NULL FOR UPDATE OF c SKIP LOCKED")
             .bind(provider_id).fetch_optional(&mut *transaction).await?;
-        Ok(credentials.map(|credentials| (transaction, credentials)))
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let login_generation =
+            sqlx::query_scalar("SELECT login_generation FROM provider_instances WHERE id=$1")
+                .bind(provider_id)
+                .fetch_one(&mut *transaction)
+                .await?;
+        let credentials = ClaudeCredentials {
+            credentials: row.try_get("credentials")?,
+            oauth_account: row.try_get("oauth_account")?,
+            user_id: row.try_get("user_id")?,
+            has_completed_onboarding: row.try_get("has_completed_onboarding")?,
+            updated_at: row.try_get("updated_at")?,
+            login_generation,
+        };
+        Ok(Some((transaction, credentials)))
     }
 
     pub async fn save_claude_credentials(
@@ -285,24 +359,26 @@ impl PgStore {
     pub async fn save_quota(
         &self,
         provider_id: &str,
+        login_generation: i64,
         windows: &[QuotaWindow],
     ) -> Result<(), ProxyError> {
         if windows.is_empty() {
             return Ok(());
         }
         let mut query = QueryBuilder::<Postgres>::new(
-            "INSERT INTO provider_quota(provider_id,window_key,observed_at,remaining_fraction,resets_at) ",
+            "INSERT INTO provider_quota(provider_id,login_generation,window_key,observed_at,remaining_fraction,resets_at) ",
         );
         let mut ordered: Vec<_> = windows.iter().collect();
         ordered.sort_unstable_by(|left, right| left.key.cmp(&right.key));
         query.push_values(ordered, |mut row, window| {
             row.push_bind(provider_id)
+                .push_bind(login_generation)
                 .push_bind(&window.key)
                 .push_bind(window.observed_at)
                 .push_bind(window.remaining_fraction)
                 .push_bind(window.resets_at);
         });
-        query.push(" ON CONFLICT(provider_id,window_key) DO UPDATE SET observed_at=EXCLUDED.observed_at,remaining_fraction=EXCLUDED.remaining_fraction,resets_at=EXCLUDED.resets_at WHERE provider_quota.observed_at <= EXCLUDED.observed_at");
+        query.push(" ON CONFLICT(provider_id,window_key) DO UPDATE SET login_generation=EXCLUDED.login_generation,observed_at=EXCLUDED.observed_at,remaining_fraction=EXCLUDED.remaining_fraction,resets_at=EXCLUDED.resets_at WHERE provider_quota.login_generation < EXCLUDED.login_generation OR (provider_quota.login_generation=EXCLUDED.login_generation AND provider_quota.observed_at <= EXCLUDED.observed_at)");
         query.build().execute(&self.pool).await?;
         Ok(())
     }

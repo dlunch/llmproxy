@@ -8,7 +8,6 @@ use reqwest::{Client, StatusCode, header::HeaderMap};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::{Postgres, Transaction};
-use tokio::time::Instant;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use super::{auth_json, credentials_need_refresh};
@@ -35,16 +34,14 @@ pub struct CodexAuth {
 pub struct DeviceLogin {
     pub verification_url: String,
     pub user_code: String,
-    device_auth_id: String,
-    interval: Duration,
-    next_poll: Instant,
-    expires_at: Instant,
+    pub device_auth_id: String,
+    pub interval_seconds: i64,
+    pub expires_at: DateTime<Utc>,
 }
 
 pub enum LoginPoll {
     Pending,
     Complete(CodexCredentials),
-    Expired,
 }
 
 #[derive(Deserialize)]
@@ -91,46 +88,33 @@ impl CodexAuth {
             .to_owned();
         let interval = body["interval"]
             .as_str()
-            .and_then(|s| s.parse::<u64>().ok())
+            .and_then(|s| s.parse::<i64>().ok())
+            .filter(|seconds| (1..=900).contains(seconds))
             .ok_or_else(|| {
                 ProxyError::new(ErrorKind::UpstreamAuth, "Invalid Codex polling interval")
             })?;
-        let now = Instant::now();
         Ok(DeviceLogin {
             verification_url: format!("{}/codex/device", self.issuer),
             user_code,
             device_auth_id,
-            interval: Duration::from_secs(interval),
-            next_poll: now,
-            expires_at: now + Duration::from_secs(15 * 60),
+            interval_seconds: interval,
+            expires_at: Utc::now() + chrono::Duration::minutes(15),
         })
     }
 
     pub async fn poll_device_login(
         &self,
-        login: &mut DeviceLogin,
+        device_auth_id: &str,
+        user_code: &str,
     ) -> Result<LoginPoll, ProxyError> {
-        if Instant::now() >= login.expires_at {
-            return Ok(LoginPoll::Expired);
-        }
-        tokio::time::sleep_until(login.next_poll.min(login.expires_at)).await;
-        if Instant::now() >= login.expires_at {
-            return Ok(LoginPoll::Expired);
-        }
         let response = self
             .client
             .post(format!("{}/api/accounts/deviceauth/token", self.issuer))
-            .timeout(
-                login
-                    .expires_at
-                    .saturating_duration_since(Instant::now())
-                    .min(Duration::from_secs(30)),
-            )
-            .json(&json!({"device_auth_id": login.device_auth_id, "user_code": login.user_code}))
+            .timeout(Duration::from_secs(30))
+            .json(&json!({"device_auth_id": device_auth_id, "user_code": user_code}))
             .send()
             .await
             .map_err(|_| ProxyError::new(ErrorKind::UpstreamAuth, "Codex login polling failed"))?;
-        login.next_poll = Instant::now() + login.interval.min(Duration::from_secs(15 * 60));
         if matches!(
             response.status(),
             StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
@@ -151,8 +135,6 @@ impl CodexAuth {
             )
         })?;
         let redirect = format!("{}/deviceauth/callback", self.issuer);
-        // A token exchange can consume the code even when its response is lost.
-        login.expires_at = Instant::now();
         let response = self
             .client
             .post(format!("{}/oauth/token", self.issuer))
@@ -248,6 +230,7 @@ impl TokenResponse {
             account_id,
             expires_at,
             updated_at: Utc::now(),
+            login_generation: previous.map_or(0, |credentials| credentials.login_generation),
         })
     }
 }
@@ -263,7 +246,6 @@ fn jwt_claims(token: &str) -> Result<Value, ProxyError> {
 }
 
 pub struct CodexProvider {
-    provider_id: String,
     store: PgStore,
     client: Client,
     auth: CodexAuth,
@@ -274,7 +256,6 @@ pub struct CodexProvider {
 
 impl CodexProvider {
     pub fn new(
-        provider_id: String,
         store: PgStore,
         client: Client,
         auth: CodexAuth,
@@ -282,7 +263,6 @@ impl CodexProvider {
         metrics: Arc<Metrics>,
     ) -> Self {
         Self {
-            provider_id,
             store,
             client,
             auth,
@@ -294,12 +274,13 @@ impl CodexProvider {
 
     async fn refresh_locked_credentials(
         &self,
+        provider_id: &str,
         transaction: Transaction<'static, Postgres>,
         credentials: CodexCredentials,
         refresh_stage: Stage,
     ) -> Result<CodexCredentials, ProxyError> {
         let auth = self.auth.clone();
-        let provider_id = self.provider_id.clone();
+        let provider_id = provider_id.to_owned();
         let metrics = self.metrics.clone();
         // Request cancellation must not discard a rotated token before persistence.
         self.workers
@@ -322,17 +303,15 @@ impl CodexProvider {
 
 #[async_trait]
 impl Provider for CodexProvider {
-    async fn refresh_credentials(&self) -> Result<(), ProxyError> {
+    async fn refresh_credentials(&self, provider_id: &str) -> Result<(), ProxyError> {
         let timer = self.metrics.time_stage(Stage::MaintenanceCredentialLock);
-        let locked = self
-            .store
-            .try_lock_codex_credentials(&self.provider_id)
-            .await;
+        let locked = self.store.try_lock_codex_credentials(provider_id).await;
         drop(timer);
         let Some((transaction, credentials)) = locked? else {
             return Ok(());
         };
         self.refresh_locked_credentials(
+            provider_id,
             transaction,
             credentials,
             Stage::MaintenanceCredentialRefresh,
@@ -348,6 +327,7 @@ impl Provider for CodexProvider {
 
     async fn infer(
         &self,
+        provider_id: &str,
         request: InferenceRequest,
         cancellation: CancellationToken,
     ) -> Result<EventStream, ProxyError> {
@@ -410,7 +390,7 @@ impl Provider for CodexProvider {
         let timer = self.metrics.time_stage(Stage::CredentialRead);
         let loaded = tokio::select! {
             _ = cancellation.cancelled() => Err(ProxyError::new(ErrorKind::Cancelled, "Request cancelled")),
-            result = self.store.codex_credentials(&self.provider_id) => result,
+            result = self.store.codex_credentials(provider_id) => result,
         };
         drop(timer);
         let mut credentials = loaded?;
@@ -418,13 +398,13 @@ impl Provider for CodexProvider {
             let timer = self.metrics.time_stage(Stage::CredentialLock);
             let locked = tokio::select! {
                 _ = cancellation.cancelled() => Err(ProxyError::new(ErrorKind::Cancelled, "Request cancelled")),
-                result = self.store.lock_codex_credentials(&self.provider_id) => result,
+                result = self.store.lock_codex_credentials(provider_id) => result,
             };
             drop(timer);
             let (transaction, current) = locked?;
             credentials = tokio::select! {
                 _ = cancellation.cancelled() => return Err(ProxyError::new(ErrorKind::Cancelled, "Request cancelled")),
-                result = self.refresh_locked_credentials(transaction, current, Stage::CredentialRefresh) => result?,
+                result = self.refresh_locked_credentials(provider_id, transaction, current, Stage::CredentialRefresh) => result?,
             };
         }
         let mut body = json!({"model":request.model, "stream":true, "store":false,
@@ -441,7 +421,9 @@ impl Provider for CodexProvider {
         };
         let quotas = quota_headers(response.headers());
         if !quotas.is_empty() {
-            self.store.save_quota(&self.provider_id, &quotas).await?;
+            self.store
+                .save_quota(provider_id, credentials.login_generation, &quotas)
+                .await?;
         }
         if !response.status().is_success() {
             let kind = match response.status() {
@@ -452,7 +434,8 @@ impl Provider for CodexProvider {
             return Err(ProxyError::new(kind, "Codex request rejected"));
         }
         let store = self.store.clone();
-        let provider_id = self.provider_id.clone();
+        let provider_id = provider_id.to_owned();
+        let login_generation = credentials.login_generation;
         Ok(Box::pin(async_stream::try_stream! {
             let mut chunks = response.bytes_stream();
             let mut line = Vec::new();
@@ -537,7 +520,7 @@ impl Provider for CodexProvider {
                             }
                             Some("codex.rate_limits") => {
                                 let windows = quota_event(&event);
-                                if !windows.is_empty() { store.save_quota(&provider_id, &windows).await?; }
+                                if !windows.is_empty() { store.save_quota(&provider_id, login_generation, &windows).await?; }
                             }
                             Some("response.completed" | "response.incomplete" | "response.failed") => {
                                 if let Some(output) = event["response"]["output"].as_array() {

@@ -7,7 +7,7 @@ helm upgrade --install llmproxy ./charts/llmproxy \
   --set database.existingSecret=llmproxy-database
 ```
 
-The Secret key defaults to `DATABASE_URL`. Supply credentials through your normal Secret management process. The chart does not create database credentials or PostgreSQL. Provision client accounts, provider ownership, and subscription credentials as described in the [repository README](../../README.md).
+The Secret key defaults to `DATABASE_URL`. Supply credentials through your normal Secret management process. The chart does not create database credentials or PostgreSQL. After startup initializes the database, issue a signup code with `scripts/issue-signup-code.sql`, then create an account and configure providers through the management API as described in the [repository README](../../README.md).
 
 | Value | Default | Purpose |
 | --- | --- | --- |
@@ -18,19 +18,17 @@ The Secret key defaults to `DATABASE_URL`. Supply credentials through your norma
 | `imagePullSecrets` | `[]` | Existing registry Secrets, e.g. `[{name: ghcr}]` |
 | `database.existingSecret` | Required | Secret containing the PostgreSQL URL |
 | `database.key` | `DATABASE_URL` | URL key in the Secret |
-| `config` | Codex and Claude examples | Complete TOML configuration, without credentials |
+| `config` | Host settings with secure cookies | Complete TOML configuration, without credentials |
 | `terminationGracePeriodSeconds` | `180` | Graceful request and OAuth refresh shutdown |
 | `resources` | `{}` | Container resource requests and limits |
 
 Override `config` using `--set-file config=your-config.toml` or a values file. Keep `listen = "0.0.0.0:8080"` for the Service and health probes. Increase the termination grace period when increasing `request_timeout_seconds`: allow at least 30 additional seconds for an in-flight OAuth refresh plus finalization margin.
 
-The Deployment uses rolling updates. PostgreSQL row locks serialize credential updates across replicas. Configuration changes trigger a rollout. The process runs as UID/GID 1000, with writable temporary storage at `/tmp`.
+The Deployment uses rolling updates. PostgreSQL stores management sessions, provider logins, credentials, and routes; row locks serialize credential updates across replicas. No sticky sessions or persistent application volume are required. TOML configuration changes trigger a rollout. The process runs as UID/GID 1000, with writable temporary storage at `/tmp`.
 
-The image includes the official Claude executable at `/usr/local/bin/claude` for amd64 and arm64. Subscription credentials remain in PostgreSQL; request files use temporary storage.
+The image includes the official Claude executable at `/usr/local/bin/claude` for amd64 and arm64, selected by `claude_executable`. Register Codex or Claude provider instances, complete their login, and set model routes through the management API. These changes apply without a rollout. Subscription credentials remain in PostgreSQL; request files use temporary storage.
 
-The default configuration enables Codex and Claude provider instances. Provision their subscription credentials and model mappings in PostgreSQL before using them.
-
-Expose the ClusterIP Service through your normal TLS/network boundary. `/health` and `/metrics` share the application listener. Use bearer tokens behind shared proxies; CIDR authentication observes the TCP peer.
+Expose the ClusterIP Service through your normal TLS/network boundary. The chart uses `cookie_secure = true`, so management sessions require HTTPS. Serve management clients on the same origin as `/management`; mutations require `X-LLMProxy-Management: 1`. `/health` and `/metrics` share the application listener. Use bearer tokens for inference behind shared proxies; CIDR authentication observes the TCP peer.
 
 Validate rendering with:
 

@@ -50,22 +50,24 @@ async fn device_login_exchanges_code_and_refreshes_rotated_credentials() {
     let url = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let auth = CodexAuth::new(reqwest::Client::new(), url.clone());
-    let mut login = auth.start_device_login().await.unwrap();
+    let login = auth.start_device_login().await.unwrap();
     assert_eq!(login.verification_url, format!("{url}/codex/device"));
     assert_eq!(login.user_code, "ABCD");
     assert!(matches!(
-        auth.poll_device_login(&mut login).await.unwrap(),
+        auth.poll_device_login(&login.device_auth_id, &login.user_code)
+            .await
+            .unwrap(),
         LoginPoll::Pending
     ));
-    let poll_started = std::time::Instant::now();
-    let LoginPoll::Complete(credentials) = auth.poll_device_login(&mut login).await.unwrap() else {
+    assert_eq!(login.interval_seconds, 1);
+    assert!(login.expires_at > chrono::Utc::now());
+    let LoginPoll::Complete(credentials) = auth
+        .poll_device_login(&login.device_auth_id, &login.user_code)
+        .await
+        .unwrap()
+    else {
         panic!("login not complete")
     };
-    assert!(poll_started.elapsed() >= std::time::Duration::from_millis(950));
-    assert!(matches!(
-        auth.poll_device_login(&mut login).await.unwrap(),
-        LoginPoll::Expired
-    ));
     assert_eq!(credentials.account_id, "workspace-1");
     assert_eq!(credentials.access_token, "access-1");
     let refreshed = auth.refresh(&credentials).await.unwrap();
@@ -82,7 +84,7 @@ use llmproxy::{
         ProviderEvent, Role, Tool, ToolCall, ToolChoice, WebSearchStatus,
     },
     providers::codex::CodexProvider,
-    store::{CodexCredentials, PgStore},
+    store::PgStore,
 };
 use std::sync::{
     Arc,
@@ -157,12 +159,14 @@ async fn codex_streams_and_refreshes_once_with_persisted_quota_and_failure_outco
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::query("INSERT INTO provider_instances(id,account_id) VALUES ($1,$2)")
-        .bind(&provider_id)
-        .bind(account_id)
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_instances(id,account_id,kind,label) VALUES ($1,$2,'codex','Codex')",
+    )
+    .bind(&provider_id)
+    .bind(account_id)
+    .execute(&pool)
+    .await
+    .unwrap();
     sqlx::query("INSERT INTO provider_credentials(provider_id,access_token,refresh_token,account_id,expires_at) VALUES ($1,'expired','refresh-1','workspace-1',now()-interval '1 second') ON CONFLICT(provider_id) DO UPDATE SET access_token='expired',refresh_token='refresh-1',expires_at=now()-interval '1 second'")
         .bind(&provider_id).execute(&pool).await.unwrap();
     let refreshes = Arc::new(AtomicUsize::new(0));
@@ -269,7 +273,6 @@ async fn codex_streams_and_refreshes_once_with_persisted_quota_and_failure_outco
         .unwrap();
     let metrics = Arc::new(llmproxy::metrics::Metrics::default());
     let provider = Arc::new(CodexProvider::new(
-        provider_id.clone(),
         store.clone(),
         client.clone(),
         CodexAuth::new(client.clone(), url.clone()),
@@ -282,7 +285,6 @@ async fn codex_streams_and_refreshes_once_with_persisted_quota_and_failure_outco
         .await
         .unwrap();
     let second_provider = CodexProvider::new(
-        provider_id.clone(),
         PgStore::new(second_pool.clone()),
         client.clone(),
         CodexAuth::new(client, url.clone()),
@@ -292,13 +294,10 @@ async fn codex_streams_and_refreshes_once_with_persisted_quota_and_failure_outco
     let mut system_request = request("ok");
     system_request.messages[0].role = Role::System;
     let (a, b) = tokio::join!(
-        provider.infer(system_request, CancellationToken::new()),
-        second_provider.infer(request("ok"), CancellationToken::new())
+        provider.infer(&provider_id, system_request, CancellationToken::new()),
+        second_provider.infer(&provider_id, request("ok"), CancellationToken::new())
     );
-    let header_states = store
-        .provider_states(account_id, std::slice::from_ref(&provider_id))
-        .await
-        .unwrap();
+    let header_states = store.provider_states(account_id).await.unwrap();
     assert!(
         header_states[0]
             .quota
@@ -319,8 +318,7 @@ async fn codex_streams_and_refreshes_once_with_persisted_quota_and_failure_outco
         assert!(stream.next().await.is_none());
     }
     assert_eq!(refreshes.load(Ordering::SeqCst), 1);
-    let credentials: CodexCredentials = sqlx::query_as("SELECT access_token,refresh_token,account_id,expires_at,updated_at FROM provider_credentials WHERE provider_id=$1")
-        .bind(&provider_id).fetch_one(&pool).await.unwrap();
+    let credentials = store.codex_credentials(&provider_id).await.unwrap();
     assert_eq!(credentials.refresh_token, "rotated");
     let before_fresh = metrics.render().unwrap();
     let lock_count = before_fresh.lines().find(|line| {
@@ -330,7 +328,7 @@ async fn codex_streams_and_refreshes_once_with_persisted_quota_and_failure_outco
     let (held, _) = store.lock_codex_credentials(&provider_id).await.unwrap();
     let mut unlocked = tokio::time::timeout(
         std::time::Duration::from_secs(1),
-        second_provider.infer(request("ok"), CancellationToken::new()),
+        second_provider.infer(&provider_id, request("ok"), CancellationToken::new()),
     )
     .await
     .expect("fresh credentials waited for an exclusive lock")
@@ -346,7 +344,7 @@ async fn codex_streams_and_refreshes_once_with_persisted_quota_and_failure_outco
             .starts_with("llmproxy_stage_duration_seconds_count{stage=\"credential_lock\"}"))
     );
 
-    provider.refresh_credentials().await.unwrap();
+    provider.refresh_credentials(&provider_id).await.unwrap();
     assert_eq!(refreshes.load(Ordering::SeqCst), 1);
     assert!(
         store
@@ -363,7 +361,7 @@ async fn codex_streams_and_refreshes_once_with_persisted_quota_and_failure_outco
         .execute(&pool)
         .await
         .unwrap();
-    provider.refresh_credentials().await.unwrap();
+    provider.refresh_credentials(&provider_id).await.unwrap();
     assert_eq!(refreshes.load(Ordering::SeqCst), 1);
     sqlx::query("UPDATE accounts SET enabled=true WHERE id=$1")
         .bind(account_id)
@@ -373,7 +371,7 @@ async fn codex_streams_and_refreshes_once_with_persisted_quota_and_failure_outco
     let (locked, _) = store.lock_codex_credentials(&provider_id).await.unwrap();
     tokio::time::timeout(
         std::time::Duration::from_secs(1),
-        second_provider.refresh_credentials(),
+        second_provider.refresh_credentials(&provider_id),
     )
     .await
     .unwrap()
@@ -381,8 +379,8 @@ async fn codex_streams_and_refreshes_once_with_persisted_quota_and_failure_outco
     assert_eq!(refreshes.load(Ordering::SeqCst), 1);
     locked.commit().await.unwrap();
     let (first, second) = tokio::join!(
-        provider.refresh_credentials(),
-        second_provider.refresh_credentials()
+        provider.refresh_credentials(&provider_id),
+        second_provider.refresh_credentials(&provider_id)
     );
     first.unwrap();
     second.unwrap();
@@ -390,35 +388,33 @@ async fn codex_streams_and_refreshes_once_with_persisted_quota_and_failure_outco
 
     sqlx::query("UPDATE provider_credentials SET refresh_token='refresh-1',expires_at=now()+interval '3 days',updated_at=now()-interval '25 hours' WHERE provider_id=$1")
         .bind(&provider_id).execute(&pool).await.unwrap();
-    provider.refresh_credentials().await.unwrap();
+    provider.refresh_credentials(&provider_id).await.unwrap();
     assert_eq!(refreshes.load(Ordering::SeqCst), 3);
 
     sqlx::query("UPDATE provider_credentials SET refresh_token='refresh-1',expires_at=NULL,updated_at=now()-interval '2 hours' WHERE provider_id=$1")
         .bind(&provider_id).execute(&pool).await.unwrap();
     reject_refresh.store(true, Ordering::SeqCst);
-    let error = provider.refresh_credentials().await.unwrap_err();
+    let error = provider
+        .refresh_credentials(&provider_id)
+        .await
+        .unwrap_err();
     assert!(matches!(error.kind, ErrorKind::UpstreamAuth));
     assert!(!error.message.contains("SECRET"));
-    let unchanged: CodexCredentials = sqlx::query_as("SELECT access_token,refresh_token,account_id,expires_at,updated_at FROM provider_credentials WHERE provider_id=$1")
-        .bind(&provider_id).fetch_one(&pool).await.unwrap();
+    let unchanged = store.codex_credentials(&provider_id).await.unwrap();
     assert_eq!(unchanged.refresh_token, "refresh-1");
     assert!(unchanged.updated_at < chrono::Utc::now() - chrono::Duration::hours(1));
     reject_refresh.store(false, Ordering::SeqCst);
     omit_expiry.store(true, Ordering::SeqCst);
-    provider.refresh_credentials().await.unwrap();
+    provider.refresh_credentials(&provider_id).await.unwrap();
     assert_eq!(refreshes.load(Ordering::SeqCst), 5);
-    let refreshed: CodexCredentials = sqlx::query_as("SELECT access_token,refresh_token,account_id,expires_at,updated_at FROM provider_credentials WHERE provider_id=$1")
-        .bind(&provider_id).fetch_one(&pool).await.unwrap();
+    let refreshed = store.codex_credentials(&provider_id).await.unwrap();
     assert_eq!(refreshed.refresh_token, "rotated");
     assert!(refreshed.expires_at.is_none());
     assert!(refreshed.updated_at > unchanged.updated_at);
-    provider.refresh_credentials().await.unwrap();
+    provider.refresh_credentials(&provider_id).await.unwrap();
     assert_eq!(refreshes.load(Ordering::SeqCst), 5);
     omit_expiry.store(false, Ordering::SeqCst);
-    let states = store
-        .provider_states(account_id, std::slice::from_ref(&provider_id))
-        .await
-        .unwrap();
+    let states = store.provider_states(account_id).await.unwrap();
     assert_eq!(states[0].quota.len(), 2);
     assert!(
         states[0]
@@ -460,7 +456,7 @@ async fn codex_streams_and_refreshes_once_with_persisted_quota_and_failure_outco
         tool_call_id: Some("previous-call".into()),
     });
     let mut stream = provider
-        .infer(tool_request, CancellationToken::new())
+        .infer(&provider_id, tool_request, CancellationToken::new())
         .await
         .unwrap();
     let mut arguments = String::new();
@@ -532,7 +528,7 @@ async fn codex_streams_and_refreshes_once_with_persisted_quota_and_failure_outco
         "incomplete",
     ] {
         let mut stream = provider
-            .infer(request(model), CancellationToken::new())
+            .infer(&provider_id, request(model), CancellationToken::new())
             .await
             .unwrap();
         let mut failed = false;
@@ -562,7 +558,7 @@ async fn codex_streams_and_refreshes_once_with_persisted_quota_and_failure_outco
     let mut unsupported = request("not-called");
     for model in ["unauthorized", "rate-limited"] {
         let error = match provider
-            .infer(request(model), CancellationToken::new())
+            .infer(&provider_id, request(model), CancellationToken::new())
             .await
         {
             Err(error) => error,
@@ -576,11 +572,11 @@ async fn codex_streams_and_refreshes_once_with_persisted_quota_and_failure_outco
     }
     unsupported.temperature = Some(0.5);
     assert!(
-        matches!(provider.infer(unsupported, CancellationToken::new()).await, Err(error) if matches!(error.kind, ErrorKind::InvalidRequest))
+        matches!(provider.infer(&provider_id, unsupported, CancellationToken::new()).await, Err(error) if matches!(error.kind, ErrorKind::InvalidRequest))
     );
     let cancelled = CancellationToken::new();
     let mut stream = provider
-        .infer(request("cancel"), cancelled.clone())
+        .infer(&provider_id, request("cancel"), cancelled.clone())
         .await
         .unwrap();
     assert!(matches!(
@@ -592,7 +588,7 @@ async fn codex_streams_and_refreshes_once_with_persisted_quota_and_failure_outco
         matches!(tokio::time::timeout(std::time::Duration::from_secs(1), stream.next()).await.unwrap(), Some(Err(error)) if matches!(error.kind, ErrorKind::Cancelled))
     );
     assert!(
-        matches!(provider.infer(request("not-called"), cancelled).await, Err(error) if matches!(error.kind, ErrorKind::Cancelled))
+        matches!(provider.infer(&provider_id, request("not-called"), cancelled).await, Err(error) if matches!(error.kind, ErrorKind::Cancelled))
     );
     sqlx::query("INSERT INTO provider_credentials(provider_id,access_token,refresh_token,account_id,expires_at) VALUES ($1,'expired','refresh-1','workspace-1',now()-interval '1 second') ON CONFLICT(provider_id) DO UPDATE SET access_token='expired',refresh_token='refresh-1',expires_at=now()-interval '1 second'")
         .bind(&provider_id).execute(&pool).await.unwrap();
@@ -601,9 +597,14 @@ async fn codex_streams_and_refreshes_once_with_persisted_quota_and_failure_outco
     tokio::pin!(notification);
     notification.as_mut().enable();
     let inference = {
+        let provider_id = provider_id.clone();
         let provider = provider.clone();
         let cancellation = cancellation.clone();
-        tokio::spawn(async move { provider.infer(request("not-called"), cancellation).await })
+        tokio::spawn(async move {
+            provider
+                .infer(&provider_id, request("not-called"), cancellation)
+                .await
+        })
     };
     notification.await;
     cancellation.cancel();

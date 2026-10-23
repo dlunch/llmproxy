@@ -7,6 +7,7 @@ A Rust subscription-backed LLM proxy with separate API, gateway, and provider mo
 - Claude through the official [Claude Code](https://code.claude.com/docs/en/overview) executable using `claude -p`.
 - Client-defined function calls/results and native web search where the provider supports them.
 - Accounts with multiple API tokens and IP CIDRs; PostgreSQL request metadata and token usage belong to the account.
+- Email/password management sessions, signup codes, provider login, routing configuration, and per-token metrics.
 - JSON request/response and operational logs on stdout; Prometheus at `/metrics` and liveness at `/health`.
 
 ## Run
@@ -19,7 +20,7 @@ cp config.example.toml config.toml
 cargo run --locked
 ```
 
-Edit provider paths before starting. `LLMPROXY_CONFIG` selects a configuration file; the default is `config.toml`. Database migrations run on startup. Register account-owned providers and their available models using the SQL below. No provider call is made until an authenticated client requests inference.
+Set `claude_executable` to the absolute path of the Claude binary. `LLMPROXY_CONFIG` selects a configuration file; the default is `config.toml`. TOML contains host settings; accounts, provider instances, and model routes are managed through the API and stored in PostgreSQL. Database migrations run on startup. OAuth setup and maintenance do not submit inference requests.
 
 The server defaults to `127.0.0.1:8080`. Operational endpoints share the listener. For remote access, place it behind your normal TLS/network boundary. CIDR authentication always uses the TCP peer, never `X-Forwarded-For` or `X-Real-IP`; behind a reverse proxy the peer is the proxy, so use API tokens rather than allowlisting a shared proxy address.
 
@@ -46,94 +47,90 @@ helm upgrade --install llmproxy ./charts/llmproxy \
 
 The chart supports multiple replicas and rolling updates. PostgreSQL row locks serialize credential refresh across replicas. The bundled executable requires no persistent volume or startup installer. See the [chart README](charts/llmproxy/README.md) for deployment and image pull settings.
 
-## Accounts and client authentication
+## Accounts and management API
 
-There is no management CLI, dashboard, or management endpoint. Seed test accounts, tokens, and networks directly in PostgreSQL; a dashboard can manage these tables later. API tokens are SHA-256 digests of high-entropy random bearer tokens, not passwords.
+Before upgrading an existing deployment, remove all `[[providers]]` entries and set the host's `claude_executable`; the old configuration is rejected. The schema update retains credentials and request history, inferring provider kind only when exactly one credential table identifies it. Providers with an unresolved kind stay inactive until an operator assigns it. Existing accounts need a normalized unique email and Argon2 PHC password hash before management login; existing inference tokens continue to work.
 
-```sql
-INSERT INTO accounts (id, label)
-VALUES ('11111111-1111-4111-8111-111111111111', 'development');
 
--- Replace the example plaintext before using this outside a local test.
-INSERT INTO api_tokens (id, account_id, label, token_hash)
-VALUES (gen_random_uuid(), '11111111-1111-4111-8111-111111111111',
-        'test token', sha256(convert_to('local-test-token', 'UTF8')));
+Issue a single-use signup code against the initialized database:
 
--- Add more tokens or CIDRs to the same account as needed.
-INSERT INTO account_ip_ranges (id, account_id, network)
-VALUES (gen_random_uuid(), '11111111-1111-4111-8111-111111111111',
-        '127.0.0.1/32');
+```sh
+psql "$DATABASE_URL" -XAt -v ON_ERROR_STOP=1 -f scripts/issue-signup-code.sql
 ```
 
-Without an Authorization header, a matching CIDR authenticates the request. Among overlapping enabled accounts, the longest prefix wins; identical CIDRs cannot belong to multiple accounts. IPv4-mapped IPv6 peers are normalized. A supplied malformed, invalid, or revoked bearer token fails authentication even on an allowed IP. Disabled accounts cannot authenticate by either method.
+The script prints the code once and stores only its SHA-256 digest. Signup consumes the code atomically with account creation. Email is the login identifier; no email delivery or verification is required. Passwords are stored as Argon2 hashes.
 
-```sql
-UPDATE api_tokens SET revoked_at = now() WHERE label = 'test token';
-UPDATE accounts SET enabled = false
-WHERE id = '11111111-1111-4111-8111-111111111111';
+Create a private `signup.json` containing `email`, `password` (8–1024 bytes), `label`, and `signup_code`. Create a private `login.json` containing the same `email` and `password`, then register and sign in:
+
+```sh
+curl http://127.0.0.1:8080/management/accounts \
+  -H 'Content-Type: application/json' -H 'X-LLMProxy-Management: 1' \
+  --data-binary @signup.json
+curl http://127.0.0.1:8080/management/sessions \
+  -H 'Content-Type: application/json' -H 'X-LLMProxy-Management: 1' \
+  --data-binary @login.json -c session.cookies
+curl http://127.0.0.1:8080/management/account -b session.cookies
 ```
+
+Login sets a 24-hour HttpOnly, SameSite=Strict cookie scoped to `/management`; it does not issue an inference token. `cookie_secure` defaults to `true` and requires HTTPS. The example configuration disables it for local HTTP development. All management mutations, including signup and login, require `X-LLMProxy-Management: 1`. Management endpoints use the session cookie and are intended for same-origin clients; inference bearer tokens and IP CIDRs do not authenticate them.
+
+Authenticated endpoints are scoped to the signed-in account. Prefix each path below with `/management` and send the session cookie:
+
+| Method and path | Request or result |
+| --- | --- |
+| `GET /account`, `PATCH /account` | Read account; update `{"label":"Personal"}` |
+| `DELETE /session` | Revoke the current management session and clear its cookie |
+| `GET /api-tokens`, `POST /api-tokens` | List tokens; create with `{"label":"Laptop"}` |
+| `DELETE /api-tokens/{id}` | Revoke an inference token |
+| `GET /api-tokens/{id}/metrics` | Request outcomes, usage, and execution latency for that token |
+| `GET /providers`, `POST /providers` | List providers; register `{"kind":"codex","label":"Main"}` |
+| `GET /providers/{id}`, `PATCH /providers/{id}` | Read provider; update `label` or `enabled` |
+| `GET /routing`, `PUT /routing` | Read or atomically replace routing strategy and all model routes |
+
+API-token creation returns the plaintext `token` once. Store it securely; subsequent reads return only metadata. Multiple tokens can belong to one account, and revocation preserves request history and metrics. Token metrics sum reported usage, expose `missing_usage_requests`, and include cancelled or failed requests with usage. `mean_execution_latency_ms` averages the persisted request interval; it excludes client authentication and routing, unlike the end-to-end Prometheus request histogram.
+
+For inference, send `Authorization: Bearer <token>`. Without an Authorization header, a matching operator-provisioned CIDR authenticates the request. Among overlapping enabled accounts, the longest prefix wins; identical CIDRs cannot belong to multiple accounts. IPv4-mapped IPv6 peers are normalized. A supplied malformed, invalid, or revoked bearer token fails authentication even on an allowed IP. Disabled accounts cannot authenticate by either method or use management sessions.
 
 ## Provider subscription setup
 
-Each configured provider instance belongs to one proxy account. Bind its TOML `id` before provisioning credentials or making requests:
+Register a provider through `POST /management/providers` with `kind` set to `codex` or `claude`, a `label`, and optional `enabled` (default `true`). Keep the returned `id` for login and routing. An account can own multiple instances of either kind. Provider metadata never includes subscription credentials; `authenticated` reports whether credentials have been saved, not whether the upstream subscription remains valid.
 
-```sql
-INSERT INTO provider_instances (id, account_id)
-VALUES ('codex-main', '11111111-1111-4111-8111-111111111111'),
-       ('claude-main', '11111111-1111-4111-8111-111111111111');
+Start login with `POST /management/providers/{id}/logins`. The response includes the login `id`, `authorization_url`, expiry, and Codex's `user_code`. Open the URL and complete the provider's authorization steps. Submit completion to `POST /management/providers/{id}/logins/{login_id}/complete`:
+
+- **Codex:** send `{}` to poll the device login, respecting `interval_seconds` and `next_poll_at`. A pending attempt returns HTTP 202; successful credential persistence returns 200.
+- **Claude:** send `{"code":"<authorization_code#state>"}` with the complete value from the authorization page. The server verifies state and completes the PKCE exchange.
+
+`GET /management/providers/{id}/logins/{login_id}` reports `pending`, `processing`, `completed`, `failed`, or `expired`. Expired or failed completion returns 409; start a new login to retry. Starting a new login replaces the previous attempt but cannot replace an in-flight exchange. Credentials and intermediate secrets remain in PostgreSQL, and concurrent replicas coordinate exchanges and refreshes with row locks. Repeating an already completed login is safe.
+
+Set model aliases with `PUT /management/routing`. This replaces the entire account configuration atomically; include every route to retain:
+
+```json
+{
+  "strategy": "least_used",
+  "routes": [
+    {"model": "codex", "provider_id": "<Codex provider id>", "upstream_model": "gpt-5.4", "priority": 0},
+    {"model": "claude", "provider_id": "<Claude provider id>", "upstream_model": "claude-sonnet-4-6", "priority": 0}
+  ]
+}
 ```
 
-An account can own multiple instances of the same kind: add another TOML provider with a distinct ID, its own subscription credentials in PostgreSQL, a matching `provider_instances` row, and available model mappings. Only instances owned by the authenticated account are visible to routing policies. Unbound configuration entries cannot serve client requests, and request records enforce the account/provider ownership relationship in PostgreSQL.
-
-Register the models available to each subscription. `model` is the client-facing alias; `upstream_model` is the provider model name. Multiple providers can serve the same alias. These example names are not an entitlement check.
-
-```sql
-INSERT INTO provider_models (provider_id, model, upstream_model)
-VALUES ('codex-main', 'codex', 'gpt-5.4'),
-       ('claude-main', 'claude', 'claude-sonnet-4-6');
-```
-
-Model mappings are read from PostgreSQL on each request. Adding or deleting a row changes availability without restarting the service; TOML contains only transport/provider configuration.
+`model` is the client-facing alias; `upstream_model` is the provider model name. Multiple providers can serve the same alias. These example names are not an entitlement check. Only enabled providers owned by the requesting account participate in routing. Complete provider login before sending inference. Provider and route changes apply without restarting the service.
 
 ### Automatic OAuth refresh
 
-While the service is running, configured providers belonging to enabled accounts are checked at startup and every minute, even without inference traffic. Access tokens are refreshed within five minutes of expiry, or after 24 hours without a successful token update. Credentials without an access-token expiry are refreshed hourly. These checks call only OAuth endpoints and do not generate billable model requests.
+While the service is running, enabled providers belonging to enabled accounts are checked at startup and every minute, even without inference traffic. At most four maintenance refreshes run at once; shutdown drains started work without starting queued refreshes. Access tokens are refreshed within five minutes of expiry, or after 24 hours without a successful token update. Credentials without an access-token expiry are refreshed hourly. These checks call only OAuth endpoints and do not generate billable model requests.
 
 Fresh credentials are read without an exclusive lock. PostgreSQL row locks coordinate refresh across requests and replicas; credentials are reread under the lock before exchanging a token. Shutdown waits for in-flight refreshes to be saved. Failed attempts are retried on the next check. Revoked refresh tokens and absolute login expiry still require a new login, and credentials cannot be maintained while the service is stopped.
 
 ### Codex
 
-`providers::codex::CodexAuth` exposes `start_device_login`, `poll_device_login`, and `refresh`. It uses the same device-authentication entrypoint and client ID as the Codex CLI; no CLI subprocess is needed. A future dashboard can call these Rust APIs. `DeviceLogin` contains the verification URL and user code. Polling yields pending, complete credentials, or expired. Refreshes are serialized per provider across replicas with a PostgreSQL row lock and persist rotated credentials before inference; shutdown drains any in-flight refresh.
-
-For manual tests, provision credentials into the provider row using SQL. `account_id` here is the **upstream ChatGPT account ID**, distinct from a proxy account UUID:
-
-```sql
-INSERT INTO provider_credentials
-    (provider_id, access_token, refresh_token, account_id, expires_at)
-VALUES ('codex-main', '<access token>', '<refresh token>',
-        '<ChatGPT account ID>', '<access token expiry timestamp>');
-```
-
-Keep credential provisioning out of request logs and shell history. The authentication implementation follows the [official Codex source](https://github.com/openai/codex/tree/091008729d5572712ac08964a9602eb71cf31428/codex-rs/login/src); device login must be enabled for the upstream account. The proxy uses `https://chatgpt.com/backend-api/codex/responses`, with subscription bearer and account headers. It does not switch to API-key billing or retry submitted inference automatically.
+Device login uses the same authentication entrypoint and client ID as the Codex CLI, without a CLI subprocess. The authentication implementation follows the [official Codex source](https://github.com/openai/codex/tree/091008729d5572712ac08964a9602eb71cf31428/codex-rs/login/src); device login must be enabled for the upstream account. The proxy uses `https://chatgpt.com/backend-api/codex/responses`, with subscription bearer and account headers. It does not switch to API-key billing or retry submitted inference automatically.
 
 ### Claude
 
-The container includes the official executable at `/usr/local/bin/claude`. For a host installation, follow the [official setup instructions](https://code.claude.com/docs/en/setup) and set `executable` in `config.toml` to its absolute path. Establish your subscription login in a private provisioning directory:
-
-```sh
-CLAUDE_CONFIG_DIR=/private/claude-login /absolute/path/to/claude auth login
-```
+The container includes the official executable at `/usr/local/bin/claude`. For a host installation, follow the [official setup instructions](https://code.claude.com/docs/en/setup) and set `claude_executable` in `config.toml` to its absolute path. The management login flow stores the subscription credentials and account metadata needed by the executable.
 
 Anthropic documents [conditional permission to preinstall unmodified Claude Code](https://code.claude.com/docs/en/legal-and-compliance#can-customers-offer-claude-code-in-their-products). This project is intended for personal, self-hosted use; that preinstallation permission does not authorize collecting other users' Claude credentials or intermediating their subscription usage. Review the linked authentication conditions before adapting it into a third-party service.
-
-Import `.credentials.json` and the login fields from `.claude.json` into the provider's database row. The credentials and OAuth account objects are externally defined JSON documents; the user ID and onboarding flag have typed columns. Use a secure database client with bound parameters for real secrets; the following shows the row shape with placeholders:
-
-```sql
-INSERT INTO claude_credentials
-    (provider_id, credentials, oauth_account, user_id, has_completed_onboarding)
-VALUES ('claude-main', '<.credentials.json contents>'::jsonb,
-        '<.claude.json oauthAccount object>'::jsonb, '<.claude.json userID>', true);
-```
 
 The host owns refresh tokens and initializes private account metadata for each invocation. Each CLI receives only its access token, allowing calls using the same provider ID to run concurrently. When the CLI requests a replacement token through its OAuth control protocol, the host coordinates refresh under a short PostgreSQL row lock and persists the result before replying. Concurrent refresh requests reuse a newer stored token. Cancellation does not discard an exchange that has already started. Child configuration, conversation history, and caches are not written back into the database.
 
@@ -145,17 +142,17 @@ Conversation history is resumed from a private temporary JSONL transcript, prese
 
 ```sh
 curl http://127.0.0.1:8080/v1/chat/completions \
-  -H 'Authorization: Bearer local-test-token' \
+  -H "Authorization: Bearer $LLMPROXY_API_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"model":"codex","messages":[{"role":"user","content":"Hello"}],"stream":true}'
 
 curl http://127.0.0.1:8080/v1/responses \
-  -H 'Authorization: Bearer local-test-token' \
+  -H "Authorization: Bearer $LLMPROXY_API_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"model":"claude","input":"Find recent Rust news","tools":[{"type":"web_search"}]}'
 ```
 
-Omit Authorization only from a configured account network. Chat Completions requests use `web_search_options: {}` for native search. Responses accepts `web_search` and `web_search_preview`. Search location/context/domain filter options are not implemented and return an error rather than being ignored.
+Set `LLMPROXY_API_TOKEN` to an issued inference token. Omit Authorization only from a configured account network. Chat Completions requests use `web_search_options: {}` for native search. Responses accepts `web_search` and `web_search_preview`. Search location/context/domain filter options are not implemented and return an error rather than being ignored.
 
 For client functions, use standard Chat Completions function tools and `assistant.tool_calls` / `tool` messages, or Responses `function` tools and `function_call` / `function_call_output` input items. The client executes the function; send its result in the next request together with the conversation history. The proxy does not persist Responses objects or support `previous_response_id` retrieval/chaining.
 
@@ -167,7 +164,7 @@ Opaque reasoning items are not retained across requests. Function-call transport
 
 `core::Provider` normalizes provider events. `gateway::RoutingPolicy` receives the full normalized request, account token totals, provider usage/quota state, and explicit routes. Register your own trait implementation in the composition layer. API adapters consume the same gateway; they do not contain provider-specific selection logic.
 
-The default policy matches model aliases exactly, excludes exhausted fresh quota windows, then chooses the provider with the lowest accumulated usage, with deterministic ties. Account usage is available to custom policies. No model substitution occurs unless explicitly configured under an alias. Unknown or stale quota stays unknown; five-minute-old snapshots and expired windows do not block selection. Codex reports window snapshots through headers/events. Claude's returned five-hour and seven-day window observations are collected when available; missing windows remain unknown. Exhausted Claude base windows exclude the provider while fresh even if Claude permits extra paid usage. Routing is advisory, not a reservation or strict spending limit.
+The configured policy matches model aliases exactly and excludes exhausted fresh quota windows. The default `least_used` strategy chooses the provider with the lowest accumulated usage; `priority` chooses the lowest route priority number. Ties are resolved by provider ID. Account usage is available to custom policies. No model substitution occurs unless explicitly configured under an alias. Unknown or stale quota stays unknown; five-minute-old snapshots and expired windows do not block selection. Codex reports window snapshots through headers/events. Claude's returned five-hour and seven-day window observations are collected when available; missing windows remain unknown. Exhausted Claude base windows exclude the provider while fresh even if Claude permits extra paid usage. Quota belongs to the current provider login, so relogin does not reuse an old account's observations. Routing is advisory, not a reservation or strict spending limit.
 
 ## Records, logs, and metrics
 
@@ -197,11 +194,13 @@ ORDER BY started_at DESC;
 
 Routing reads stored `input_tokens`/`output_tokens` totals on `accounts` and `provider_instances`, avoiding a history scan on every request. A database trigger updates both totals atomically with request usage changes, including reported usage on failed or cancelled requests. Unknown usage contributes zero to routing totals while remaining null in request records. Counter updates briefly serialize completions for the same account. The usage-totals migration initializes existing data while holding a request writer lock; it does not discard history. Treat these totals as database-maintained fields.
 
-Stdout uses tracing's JSON format. Request/response body fields contain serialized JSON; streaming responses log each event, correlated by `request_id` and `account_id`. Request bodies and function arguments/results can contain sensitive application content, as requested; authentication headers and provider credentials are never added by the logger. Configure stdout retention/access in your deployment. `RUST_LOG` controls filtering; the default includes `llmproxy=info`.
+Stdout uses tracing's JSON format. Inference request/response body fields contain serialized JSON; streaming responses log each event, correlated by `request_id` and `account_id`. Request bodies and function arguments/results can contain sensitive application content, as requested; authentication headers and provider credentials are never added by the logger. Management request bodies are not logged. Configure stdout retention/access in your deployment. `RUST_LOG` controls filtering; the default includes `llmproxy=info`.
 
 Log output runs on a dedicated worker with a bounded 256-record queue and a standard output buffer flushed between batches. Formatting still runs on the caller; a full queue applies backpressure instead of dropping records. Graceful shutdown drains queued output and reports sink failures. The queue bounds record count rather than bytes, and a stalled stdout sink can delay requests or shutdown.
 
-Prometheus exposes inference outcome counters, active requests, latency, provider errors, and observed token counters. `llmproxy_stage_duration_seconds` measures `authentication`, `routing`, `credential_read`, `credential_lock`, `credential_refresh`, `provider_setup`, and `first_text`; background work uses separate `maintenance_credential_lock` and `maintenance_credential_refresh` stages. Buckets include millisecond-scale durations. Labels contain configured provider IDs and fixed stages/outcomes/directions, not account IDs, arbitrary model input, or secrets.
+Prometheus exposes inference outcome counters, active requests, latency, provider errors, and observed token counters with provider ID, API-token ID, and authentication-source labels. CIDR requests have an empty token ID. `llmproxy_rejected_requests_total` separately counts authenticated requests rejected before durable admission, such as unavailable routes or exhausted quota; these are absent from request-history metrics. Authentication failures are excluded. Labels never contain token secrets, account IDs, or arbitrary model input.
+
+`llmproxy_stage_duration_seconds` measures `authentication`, `routing`, `credential_read`, `credential_lock`, `credential_refresh`, `provider_setup`, and `first_text`; background work uses separate `maintenance_credential_lock` and `maintenance_credential_refresh` stages. Stage labels are fixed and buckets include millisecond-scale durations.
 
 The request-duration histogram starts at inference handler entry and ends after durable terminal accounting, including authentication and routing. Framework body extraction before handler entry and final client network drain are outside that interval. `first_text` ends at the first nonempty text delta received by the gateway; metadata, empty deltas, and tool-only responses do not count. Provider setup ends when `infer` returns its stream. Stage durations can overlap and should not be summed. Failed authentication contributes an authentication timing but is rejected before provider accounting.
 

@@ -7,7 +7,7 @@ use llmproxy::{
         ProviderEvent, Role, Tool, ToolCall, ToolChoice, WebSearchStatus,
     },
     providers::claude::{ClaudeAuth, ClaudeProvider},
-    store::{ClaudeCredentials, PgStore},
+    store::PgStore,
 };
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
@@ -115,7 +115,6 @@ async fn fixture() -> (tempfile::TempDir, ClaudeProvider, sqlx::PgPool) {
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
     let pool = auth_database().await;
     let provider = ClaudeProvider::new(
-        "claude-main".into(),
         script,
         PgStore::new(pool.clone()),
         ClaudeAuth::new(reqwest::Client::new(), "http://127.0.0.1:1/token".into()),
@@ -148,7 +147,7 @@ async fn auth_database() -> sqlx::PgPool {
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::query("INSERT INTO provider_instances(id,account_id) VALUES ('claude-main',$1)")
+    sqlx::query("INSERT INTO provider_instances(id,account_id,kind,label) VALUES ('claude-main',$1,'claude','Claude')")
         .bind(account)
         .execute(&pool)
         .await
@@ -156,6 +155,80 @@ async fn auth_database() -> sqlx::PgPool {
     sqlx::query("INSERT INTO claude_credentials(provider_id,credentials,oauth_account,user_id) VALUES ('claude-main',$1,$2,'fixture-user')")
         .bind(json!({"claudeAiOauth":{"accessToken":"fixture-access","refreshToken":"fixture-refresh","scopes":["user:inference"],"subscriptionType":"max","rateLimitTier":"fixture-tier"}})).bind(json!({"accountUuid":"fixture-account"})).execute(&pool).await.unwrap();
     pool
+}
+
+async fn complete_browser_login(pool: &sqlx::PgPool, token_endpoint: &str) {
+    use axum::{body::Body, http::Request};
+    use http_body_util::BodyExt;
+    use llmproxy::management::{ManagementState, oauth::OAuthManager, router};
+    use llmproxy::providers::codex::CodexAuth;
+    use sha2::{Digest, Sha256};
+    use tower::ServiceExt;
+
+    let session = format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
+    sqlx::query(
+        "UPDATE accounts SET email='claude@example.test',password_hash='unused-fixture-hash'",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO management_sessions(id,account_id,token_hash,expires_at) SELECT $1,account_id,$2,now()+interval '1 hour' FROM provider_instances WHERE id='claude-main'")
+        .bind(uuid::Uuid::new_v4()).bind(Sha256::digest(session.as_bytes()).as_slice())
+        .execute(pool).await.unwrap();
+    let store = PgStore::new(pool.clone());
+    let client = reqwest::Client::new();
+    let manager = Arc::new(OAuthManager::new(
+        store.clone(),
+        CodexAuth::new(client.clone(), "http://127.0.0.1:1".into()),
+        ClaudeAuth::new(client, token_endpoint.into()),
+    ));
+    let app = router(ManagementState::new(store, manager.clone(), false));
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/management/providers/claude-main/logins")
+                .header("cookie", format!("llmproxy_session={session}"))
+                .header("X-LLMProxy-Management", "1")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201);
+    let login: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let url = reqwest::Url::parse(login["authorization_url"].as_str().unwrap()).unwrap();
+    let state = url
+        .query_pairs()
+        .find(|(key, _)| key == "state")
+        .unwrap()
+        .1
+        .into_owned();
+    let response = app
+        .oneshot(
+            Request::post(format!(
+                "/management/providers/claude-main/logins/{}/complete",
+                login["id"].as_str().unwrap()
+            ))
+            .header("cookie", format!("llmproxy_session={session}"))
+            .header("X-LLMProxy-Management", "1")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"code":format!("fixture-code#{state}")}).to_string(),
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    manager.shutdown().await;
 }
 
 fn request(model: &str) -> InferenceRequest {
@@ -220,7 +293,7 @@ async fn subprocess_requires_successful_result_and_exit() {
         .await
         .unwrap();
         let mut stream = provider
-            .infer(request(scenario), CancellationToken::new())
+            .infer("claude-main", request(scenario), CancellationToken::new())
             .await
             .unwrap();
         let mut text = String::new();
@@ -293,7 +366,7 @@ async fn parallel_function_handoff_preserves_calls_and_cumulative_search_usage()
     let mut input = request("parallel");
     input.tools = vec![Tool::WebSearch, function()];
     let mut stream = provider
-        .infer(input, CancellationToken::new())
+        .infer("claude-main", input, CancellationToken::new())
         .await
         .unwrap();
     let mut calls = vec![];
@@ -374,8 +447,10 @@ async fn parallel_function_handoff_preserves_calls_and_cumulative_search_usage()
     );
     assert!(!dir.path().join("unexpected-tool-response").exists());
     assert_process_terminated(dir.path()).await;
-    let saved = sqlx::query_as::<_, ClaudeCredentials>("SELECT credentials,oauth_account,user_id,has_completed_onboarding,updated_at FROM claude_credentials WHERE provider_id='claude-main'")
-        .fetch_one(&pool).await.unwrap();
+    let saved = PgStore::new(pool.clone())
+        .claude_credentials("claude-main")
+        .await
+        .unwrap();
     assert_eq!(
         saved.credentials["claudeAiOauth"]["accessToken"],
         "fixture-access"
@@ -419,7 +494,7 @@ async fn history_keeps_function_calls_and_client_results_in_separate_roles() {
         tool_call_id: Some("call-prior".into()),
     });
     let mut stream = provider
-        .infer(input, CancellationToken::new())
+        .infer("claude-main", input, CancellationToken::new())
         .await
         .unwrap();
     while let Some(event) = stream.next().await {
@@ -448,7 +523,7 @@ async fn cancellation_and_dropped_stream_terminate_the_subprocess() {
         let (dir, provider, pool) = fixture().await;
         let cancellation = CancellationToken::new();
         let mut stream = provider
-            .infer(request("cancel"), cancellation.clone())
+            .infer("claude-main", request("cancel"), cancellation.clone())
             .await
             .unwrap();
         if mode == "never-polled" {
@@ -475,8 +550,10 @@ async fn cancellation_and_dropped_stream_terminate_the_subprocess() {
         drop(stream);
         provider.shutdown().await;
         assert_process_terminated(dir.path()).await;
-        let saved = sqlx::query_as::<_, ClaudeCredentials>("SELECT credentials,oauth_account,user_id,has_completed_onboarding,updated_at FROM claude_credentials WHERE provider_id='claude-main'")
-        .fetch_one(&pool).await.unwrap();
+        let saved = PgStore::new(pool.clone())
+            .claude_credentials("claude-main")
+            .await
+            .unwrap();
         assert_eq!(
             saved.credentials["claudeAiOauth"]["accessToken"],
             "fixture-access"
@@ -508,6 +585,11 @@ async fn actual_cli_roundtrips_parallel_calls_against_a_local_messages_api() {
         .route("/oauth/token",post(move |Json(body):Json<Value>| {
             let counter = counter.clone();
             async move {
+                if body["grant_type"] == "authorization_code" {
+                    assert_eq!(body["code"], "fixture-code");
+                    return Json(json!({"access_token":"fixture-access","refresh_token":"fixture-refresh","expires_in":3600,"scope":"user:profile user:inference"}));
+                }
+                assert_eq!(body["grant_type"], "refresh_token");
                 assert_eq!(body["refresh_token"], "fixture-refresh");
                 counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Json(json!({"access_token":"official-renewed","refresh_token":"official-rotated","expires_in":3600}))
@@ -562,8 +644,19 @@ async fn actual_cli_roundtrips_parallel_calls_against_a_local_messages_api() {
     std::fs::write(&wrapper,format!("#!/usr/bin/env python3\nimport os,sys\nos.environ['ANTHROPIC_BASE_URL']='http://{address}'\nos.execv({executable_json},[{executable_json}]+sys.argv[1:])\n")).unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
     let pool = auth_database().await;
+    sqlx::query("DELETE FROM claude_credentials WHERE provider_id='claude-main'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    complete_browser_login(&pool, &format!("http://{address}/oauth/token")).await;
+    let login = PgStore::new(pool.clone())
+        .claude_credentials("claude-main")
+        .await
+        .unwrap();
+    assert!(login.oauth_account.is_none());
+    assert!(login.user_id.is_none());
+    assert_eq!(login.login_generation, 1);
     let provider = ClaudeProvider::new(
-        "claude-main".into(),
         wrapper,
         PgStore::new(pool.clone()),
         ClaudeAuth::new(
@@ -575,7 +668,7 @@ async fn actual_cli_roundtrips_parallel_calls_against_a_local_messages_api() {
     let mut initial = request("claude-sonnet-4-6");
     initial.tools = vec![function()];
     let mut stream = provider
-        .infer(initial, CancellationToken::new())
+        .infer("claude-main", initial, CancellationToken::new())
         .await
         .unwrap();
     let mut calls = Vec::new();
@@ -623,7 +716,7 @@ async fn actual_cli_roundtrips_parallel_calls_against_a_local_messages_api() {
         });
     }
     let mut stream = provider
-        .infer(followup, CancellationToken::new())
+        .infer("claude-main", followup, CancellationToken::new())
         .await
         .unwrap();
     let mut text = String::new();
@@ -715,7 +808,6 @@ async fn concurrent_calls_share_credentials_and_persist_quota_independently() {
         .await
         .unwrap();
     let second_provider = ClaudeProvider::new(
-        "claude-main".into(),
         dir.path().join("claude"),
         PgStore::new(second_pool),
         ClaudeAuth::new(reqwest::Client::new(), "http://127.0.0.1:1/token".into()),
@@ -723,7 +815,11 @@ async fn concurrent_calls_share_credentials_and_persist_quota_independently() {
     );
     let first = async {
         let mut stream = provider
-            .infer(request("concurrent"), CancellationToken::new())
+            .infer(
+                "claude-main",
+                request("concurrent"),
+                CancellationToken::new(),
+            )
             .await
             .unwrap();
         while let Some(event) = stream.next().await {
@@ -732,7 +828,11 @@ async fn concurrent_calls_share_credentials_and_persist_quota_independently() {
     };
     let second = async {
         let mut stream = second_provider
-            .infer(request("concurrent"), CancellationToken::new())
+            .infer(
+                "claude-main",
+                request("concurrent"),
+                CancellationToken::new(),
+            )
             .await
             .unwrap();
         while let Some(event) = stream.next().await {
@@ -748,7 +848,7 @@ async fn concurrent_calls_share_credentials_and_persist_quota_independently() {
     let (held, _) = store.lock_claude_credentials("claude-main").await.unwrap();
     let mut unlocked = tokio::time::timeout(
         Duration::from_secs(1),
-        second_provider.infer(request("success"), CancellationToken::new()),
+        second_provider.infer("claude-main", request("success"), CancellationToken::new()),
     )
     .await
     .expect("fresh Claude credentials waited for a row lock")
@@ -757,8 +857,10 @@ async fn concurrent_calls_share_credentials_and_persist_quota_independently() {
         event.unwrap();
     }
     held.commit().await.unwrap();
-    let saved = sqlx::query_as::<_, ClaudeCredentials>("SELECT credentials,oauth_account,user_id,has_completed_onboarding,updated_at FROM claude_credentials WHERE provider_id='claude-main'")
-        .fetch_one(&pool).await.unwrap();
+    let saved = PgStore::new(pool.clone())
+        .claude_credentials("claude-main")
+        .await
+        .unwrap();
     assert_eq!(
         saved.credentials["claudeAiOauth"]["accessToken"],
         "fixture-access"
@@ -775,7 +877,7 @@ async fn concurrent_calls_share_credentials_and_persist_quota_independently() {
     sqlx::raw_sql("CREATE FUNCTION reject_quota_update() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture rejection'; END $$; CREATE TRIGGER reject_quota_update BEFORE INSERT OR UPDATE ON provider_quota FOR EACH ROW EXECUTE FUNCTION reject_quota_update();")
         .execute(&pool).await.unwrap();
     let mut stream = provider
-        .infer(request("success"), CancellationToken::new())
+        .infer("claude-main", request("success"), CancellationToken::new())
         .await
         .unwrap();
     let mut quota_failed = false;
@@ -854,14 +956,12 @@ async fn idle_oauth_refresh_preserves_credentials_and_coordinates_replicas() {
         .await
         .unwrap();
     let first = ClaudeProvider::new(
-        "claude-main".into(),
         "/must-not-run-claude".into(),
         PgStore::new(pool.clone()),
         ClaudeAuth::new(reqwest::Client::new(), endpoint.clone()),
         Arc::new(llmproxy::metrics::Metrics::default()),
     );
     let second = ClaudeProvider::new(
-        "claude-main".into(),
         "/must-not-run-claude".into(),
         PgStore::new(second_pool),
         ClaudeAuth::new(reqwest::Client::new(), endpoint),
@@ -873,7 +973,10 @@ async fn idle_oauth_refresh_preserves_credentials_and_coordinates_replicas() {
         .execute(&pool)
         .await
         .unwrap();
-    let (a, b) = tokio::join!(first.refresh_credentials(), second.refresh_credentials());
+    let (a, b) = tokio::join!(
+        first.refresh_credentials("claude-main"),
+        second.refresh_credentials("claude-main")
+    );
     a.unwrap();
     b.unwrap();
     assert_eq!(calls.lock().unwrap().len(), 1);
@@ -899,12 +1002,12 @@ async fn idle_oauth_refresh_preserves_credentials_and_coordinates_replicas() {
         updated["claudeAiOauth"]["expiresAt"].as_i64().unwrap()
             > chrono::Utc::now().timestamp_millis()
     );
-    first.refresh_credentials().await.unwrap();
+    first.refresh_credentials("claude-main").await.unwrap();
     assert_eq!(calls.lock().unwrap().len(), 1);
 
     mode.store(1, Ordering::SeqCst);
     sqlx::query("UPDATE claude_credentials SET credentials=jsonb_set(credentials,'{claudeAiOauth,expiresAt}','null'),updated_at=now()-interval '2 hours' WHERE provider_id='claude-main'").execute(&pool).await.unwrap();
-    first.refresh_credentials().await.unwrap();
+    first.refresh_credentials("claude-main").await.unwrap();
     let refreshed: Value = sqlx::query_scalar(
         "SELECT credentials FROM claude_credentials WHERE provider_id='claude-main'",
     )
@@ -930,7 +1033,7 @@ async fn idle_oauth_refresh_preserves_credentials_and_coordinates_replicas() {
             .await
             .unwrap();
         let error = first
-            .refresh_credentials()
+            .refresh_credentials("claude-main")
             .await
             .expect_err("invalid refresh must fail");
         assert!(matches!(error.kind, ErrorKind::UpstreamAuth));
@@ -944,10 +1047,10 @@ async fn idle_oauth_refresh_preserves_credentials_and_coordinates_replicas() {
         assert_eq!(retained, imported);
     }
     mode.store(1, Ordering::SeqCst);
-    first.refresh_credentials().await.unwrap();
+    first.refresh_credentials("claude-main").await.unwrap();
     sqlx::query("UPDATE claude_credentials SET credentials=$1 WHERE provider_id='claude-main'")
         .bind(json!({"claudeAiOauth":{"accessToken":"old","refreshToken":"default-refresh","expiresAt":0}})).execute(&pool).await.unwrap();
-    first.refresh_credentials().await.unwrap();
+    first.refresh_credentials("claude-main").await.unwrap();
     let default_call = calls.lock().unwrap().last().unwrap().clone();
     assert_eq!(
         default_call["client_id"],
@@ -960,10 +1063,13 @@ async fn idle_oauth_refresh_preserves_credentials_and_coordinates_replicas() {
     let successful_calls = calls.lock().unwrap().len();
     let store = PgStore::new(pool.clone());
     let (lock, _) = store.lock_claude_credentials("claude-main").await.unwrap();
-    tokio::time::timeout(Duration::from_secs(1), second.refresh_credentials())
-        .await
-        .unwrap()
-        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        second.refresh_credentials("claude-main"),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     lock.rollback().await.unwrap();
     sqlx::query("UPDATE claude_credentials SET credentials=$1 WHERE provider_id='claude-main'")
         .bind(&imported)
@@ -974,7 +1080,7 @@ async fn idle_oauth_refresh_preserves_credentials_and_coordinates_replicas() {
         .execute(&pool)
         .await
         .unwrap();
-    first.refresh_credentials().await.unwrap();
+    first.refresh_credentials("claude-main").await.unwrap();
     sqlx::query("UPDATE accounts SET enabled=true")
         .execute(&pool)
         .await
@@ -983,12 +1089,12 @@ async fn idle_oauth_refresh_preserves_credentials_and_coordinates_replicas() {
         .execute(&pool)
         .await
         .unwrap();
-    first.refresh_credentials().await.unwrap();
+    first.refresh_credentials("claude-main").await.unwrap();
     sqlx::query("DELETE FROM claude_credentials WHERE provider_id='claude-main'")
         .execute(&pool)
         .await
         .unwrap();
-    first.refresh_credentials().await.unwrap();
+    first.refresh_credentials("claude-main").await.unwrap();
     assert_eq!(calls.lock().unwrap().len(), successful_calls);
     server.abort();
 }
@@ -1006,6 +1112,9 @@ async fn oauth_callbacks_coordinate_replicas_and_persist_after_cancellation() {
     let app = Router::new().route("/token", post(move |Json(body): Json<Value>| {
         let (counter, arrived, proceed) = (counter.clone(), arrived.clone(), proceed.clone());
         async move {
+            if body["grant_type"] == "authorization_code" {
+                return Json(json!({"access_token":"relogin-access","refresh_token":"fixture-refresh-relogin","expires_in":3600,"scope":"user:inference","account":{"uuid":"fixture-account"}}));
+            }
             assert_eq!(body["grant_type"], "refresh_token");
             assert!(body["refresh_token"].as_str().unwrap().starts_with("fixture-refresh")
                 || body["refresh_token"].as_str().unwrap().starts_with("rotated-"));
@@ -1025,24 +1134,26 @@ async fn oauth_callbacks_coordinate_replicas_and_persist_after_cancellation() {
         .unwrap();
     let metrics = Arc::new(llmproxy::metrics::Metrics::default());
     let first = Arc::new(ClaudeProvider::new(
-        "claude-main".into(),
         directory.path().join("claude"),
         PgStore::new(pool.clone()),
         ClaudeAuth::new(reqwest::Client::new(), url.clone()),
         metrics.clone(),
     ));
     let second = Arc::new(ClaudeProvider::new(
-        "claude-main".into(),
         directory.path().join("claude"),
         PgStore::new(other_pool),
-        ClaudeAuth::new(reqwest::Client::new(), url),
+        ClaudeAuth::new(reqwest::Client::new(), url.clone()),
         metrics.clone(),
     ));
     let mut jobs = Vec::new();
     for provider in [first.clone(), second.clone()] {
         jobs.push(tokio::spawn(async move {
             let mut stream = provider
-                .infer(request("refresh-concurrent"), CancellationToken::new())
+                .infer(
+                    "claude-main",
+                    request("refresh-concurrent"),
+                    CancellationToken::new(),
+                )
                 .await
                 .unwrap();
             let mut finished = false;
@@ -1063,7 +1174,7 @@ async fn oauth_callbacks_coordinate_replicas_and_persist_after_cancellation() {
     let maintenance = {
         let provider = second.clone();
         tokio::spawn(async move {
-            provider.refresh_credentials().await.unwrap();
+            provider.refresh_credentials("claude-main").await.unwrap();
         })
     };
     release.add_permits(1);
@@ -1078,7 +1189,11 @@ async fn oauth_callbacks_coordinate_replicas_and_persist_after_cancellation() {
 
     // A child with an older token reuses an already persisted replacement.
     let mut delayed = first
-        .infer(request("refresh-delayed"), CancellationToken::new())
+        .infer(
+            "claude-main",
+            request("refresh-delayed"),
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
@@ -1099,7 +1214,11 @@ async fn oauth_callbacks_coordinate_replicas_and_persist_after_cancellation() {
     // A second rejection refers to the token last returned to that child.
     release.add_permits(2);
     let mut twice = first
-        .infer(request("refresh-twice"), CancellationToken::new())
+        .infer(
+            "claude-main",
+            request("refresh-twice"),
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
     while let Some(event) = twice.next().await {
@@ -1112,7 +1231,11 @@ async fn oauth_callbacks_coordinate_replicas_and_persist_after_cancellation() {
         .execute(&pool).await.unwrap();
     release.add_permits(1);
     let mut failure = first
-        .infer(request("refresh-once"), CancellationToken::new())
+        .infer(
+            "claude-main",
+            request("refresh-once"),
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
     let error = failure.next().await.unwrap().err().unwrap();
@@ -1127,9 +1250,9 @@ async fn oauth_callbacks_coordinate_replicas_and_persist_after_cancellation() {
         .execute(&pool).await.unwrap();
     release.add_permits(1);
     let (a, b, maintained) = tokio::join!(
-        first.infer(request("success"), CancellationToken::new()),
-        second.infer(request("success"), CancellationToken::new()),
-        first.refresh_credentials(),
+        first.infer("claude-main", request("success"), CancellationToken::new()),
+        second.infer("claude-main", request("success"), CancellationToken::new()),
+        first.refresh_credentials("claude-main"),
     );
     maintained.unwrap();
     for mut stream in [a.unwrap(), b.unwrap()] {
@@ -1140,9 +1263,51 @@ async fn oauth_callbacks_coordinate_replicas_and_persist_after_cancellation() {
     assert_eq!(calls.load(Ordering::SeqCst), 5);
     started.acquire().await.unwrap().forget();
 
+    // An existing child cannot receive credentials from a later browser login.
+    std::fs::remove_file(directory.path().join("auth-delayed")).unwrap();
+    std::fs::remove_file(directory.path().join("auth-release")).unwrap();
+    let mut old_login = first
+        .infer(
+            "claude-main",
+            request("refresh-delayed"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !directory.path().join("auth-delayed").exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let old_pid = std::fs::read_to_string(directory.path().join("pid")).unwrap();
+    complete_browser_login(&pool, &url).await;
+    let replacement = PgStore::new(pool.clone())
+        .claude_credentials("claude-main")
+        .await
+        .unwrap();
+    assert_eq!(replacement.login_generation, 1);
+    assert_eq!(
+        replacement.credentials["claudeAiOauth"]["accessToken"],
+        "relogin-access"
+    );
+    std::fs::write(directory.path().join("auth-release"), "ready").unwrap();
+    let error = old_login.next().await.unwrap().err().unwrap();
+    assert!(matches!(error.kind, ErrorKind::UpstreamAuth));
+    assert!(old_login.next().await.is_none());
+    assert!(
+        !directory
+            .path()
+            .join(format!("auth-reply-{old_pid}-0"))
+            .exists()
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 5);
+    assert_process_terminated(directory.path()).await;
+
     let cancellation = CancellationToken::new();
     let stream = first
-        .infer(request("refresh-once"), cancellation.clone())
+        .infer("claude-main", request("refresh-once"), cancellation.clone())
         .await
         .unwrap();
     tokio::time::timeout(Duration::from_secs(3), started.acquire())

@@ -6,7 +6,9 @@ use prometheus_client::{
     registry::Registry,
 };
 
-use crate::core::Usage;
+use crate::core::{ErrorKind, Usage};
+
+type Labels = Vec<(&'static str, String)>;
 
 const LATENCY_BUCKETS: [f64; 16] = [
     0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0, 15.0, 30.0, 60.0, 180.0,
@@ -46,11 +48,12 @@ impl Drop for StageTimer<'_> {
 
 pub struct Metrics {
     registry: Registry,
-    requests: Family<Vec<(String, String)>, Counter>,
-    failures: Family<Vec<(String, String)>, Counter>,
-    active: Family<Vec<(String, String)>, Gauge>,
-    tokens: Family<Vec<(String, String)>, Counter>,
-    latency: Histogram,
+    requests: Family<Labels, Counter>,
+    failures: Family<Labels, Counter>,
+    rejected: Family<Labels, Counter>,
+    active: Family<Labels, Gauge>,
+    tokens: Family<Labels, Counter>,
+    latency: Family<Labels, Histogram>,
     stages: Family<StageLabel, Histogram>,
 }
 
@@ -59,12 +62,19 @@ impl Default for Metrics {
         let mut registry = Registry::default();
         let requests = Family::default();
         let failures = Family::default();
+        let rejected = Family::default();
         let active = Family::default();
         let tokens = Family::default();
-        let latency = Histogram::new(LATENCY_BUCKETS);
+        let latency =
+            Family::<Labels, Histogram>::new_with_constructor(|| Histogram::new(LATENCY_BUCKETS));
         let stages = Family::<StageLabel, Histogram>::new_with_constructor(|| {
             Histogram::new(LATENCY_BUCKETS)
         });
+        registry.register(
+            "llmproxy_rejected_requests",
+            "Authenticated inference requests rejected before durable admission",
+            rejected.clone(),
+        );
         registry.register(
             "llmproxy_requests",
             "Finalized inference requests",
@@ -99,6 +109,7 @@ impl Default for Metrics {
             registry,
             requests,
             failures,
+            rejected,
             active,
             tokens,
             latency,
@@ -134,42 +145,90 @@ impl Metrics {
             .observe(elapsed.as_secs_f64());
     }
 
-    pub fn started(&self, provider: &str) {
+    pub fn started(&self, provider: &str, api_token_id: Option<uuid::Uuid>) {
         self.active
-            .get_or_create(&vec![("provider".into(), provider.into())])
+            .get_or_create(&vec![
+                ("provider", provider.into()),
+                (
+                    "api_token_id",
+                    api_token_id.map(|id| id.to_string()).unwrap_or_default(),
+                ),
+                (
+                    "auth_source",
+                    if api_token_id.is_some() {
+                        "api_token"
+                    } else {
+                        "ip"
+                    }
+                    .into(),
+                ),
+            ])
+            .inc();
+    }
+
+    pub fn rejected(&self, api_token_id: Option<uuid::Uuid>, error: ErrorKind) {
+        self.rejected
+            .get_or_create(&vec![
+                (
+                    "api_token_id",
+                    api_token_id.map(|id| id.to_string()).unwrap_or_default(),
+                ),
+                (
+                    "auth_source",
+                    if api_token_id.is_some() {
+                        "api_token"
+                    } else {
+                        "ip"
+                    }
+                    .into(),
+                ),
+                ("error_kind", error.as_str().into()),
+            ])
             .inc();
     }
 
     pub fn finished(
         &self,
         provider: &str,
+        api_token_id: Option<uuid::Uuid>,
         outcome: &str,
         elapsed: Duration,
         usage: Option<&Usage>,
     ) {
-        let labels = vec![
-            ("provider".into(), provider.into()),
-            ("outcome".into(), outcome.into()),
+        let mut labels = vec![
+            ("provider", provider.into()),
+            (
+                "api_token_id",
+                api_token_id.map(|id| id.to_string()).unwrap_or_default(),
+            ),
+            (
+                "auth_source",
+                if api_token_id.is_some() {
+                    "api_token"
+                } else {
+                    "ip"
+                }
+                .into(),
+            ),
         ];
+        self.active.get_or_create(&labels).dec();
+        self.latency
+            .get_or_create(&labels)
+            .observe(elapsed.as_secs_f64());
+        labels.push(("outcome", outcome.into()));
         self.requests.get_or_create(&labels).inc();
         if outcome == "failed" || outcome == "timed_out" {
             self.failures.get_or_create(&labels).inc();
         }
-        self.active
-            .get_or_create(&vec![("provider".into(), provider.into())])
-            .dec();
-        self.latency.observe(elapsed.as_secs_f64());
+        labels.pop();
         if let Some(usage) = usage {
             for (direction, count) in [
                 ("input", usage.input_tokens),
                 ("output", usage.output_tokens),
             ] {
-                self.tokens
-                    .get_or_create(&vec![
-                        ("provider".into(), provider.into()),
-                        ("direction".into(), direction.into()),
-                    ])
-                    .inc_by(count);
+                labels.push(("direction", direction.into()));
+                self.tokens.get_or_create(&labels).inc_by(count);
+                labels.pop();
             }
         }
     }

@@ -20,8 +20,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     core::{
-        ErrorKind, FunctionDefinition, InferenceRequest, Message, Principal, ProxyError, Role,
-        Tool, ToolCall, ToolChoice,
+        Credential, ErrorKind, FunctionDefinition, InferenceRequest, Message, Principal,
+        ProxyError, Role, Tool, ToolCall, ToolChoice,
     },
     gateway::Gateway,
     metrics::{Metrics, Stage},
@@ -70,6 +70,8 @@ impl ProxyError {
         let status = match self.kind {
             ErrorKind::InvalidRequest => StatusCode::BAD_REQUEST,
             ErrorKind::Unauthorized => StatusCode::UNAUTHORIZED,
+            ErrorKind::NotFound => StatusCode::NOT_FOUND,
+            ErrorKind::Conflict => StatusCode::CONFLICT,
             ErrorKind::ModelNotFound => StatusCode::NOT_FOUND,
             ErrorKind::QuotaExceeded => StatusCode::TOO_MANY_REQUESTS,
             ErrorKind::Unavailable | ErrorKind::Persistence => StatusCode::SERVICE_UNAVAILABLE,
@@ -511,62 +513,72 @@ async fn chat(
         peer.map(|Extension(ConnectInfo(addr))| addr.ip()),
     )
     .await?;
-    let Json(request_body) = body.map_err(|_| invalid("Invalid Chat Completions JSON request"))?;
-    let body = ChatRequest::deserialize(&request_body)
-        .map_err(|_| invalid("Invalid or unsupported Chat Completions request"))?;
-    if body.n.is_some_and(|n| n != 1) {
-        return Err(invalid("Only n=1 is supported"));
-    }
-    if body.stream_options.is_some() && !body.stream {
-        return Err(invalid("stream_options requires stream=true"));
-    }
-    if body.max_tokens.is_some() && body.max_completion_tokens.is_some() {
-        return Err(invalid("Specify only one output token limit"));
-    }
-    let stop = match body.stop {
-        None | Some(Value::Null) => Vec::new(),
-        Some(Value::String(text)) if !text.is_empty() => vec![text],
-        Some(Value::Array(values)) if !values.is_empty() && values.len() <= 4 => values
-            .into_iter()
-            .map(|value| match value {
-                Value::String(text) if !text.is_empty() => Ok(text),
-                _ => Err(invalid("Invalid stop sequence")),
-            })
-            .collect::<Result<Vec<_>, _>>()?,
-        _ => return Err(invalid("stop must contain one to four nonempty strings")),
-    };
-    let (tools, tool_choice) = tools(
-        body.tools.unwrap_or_default(),
-        body.tool_choice,
-        false,
-        body.web_search_options,
-    )?;
-    let request = InferenceRequest {
-        tools,
-        tool_choice,
-        model: body.model.clone(),
-        messages: messages(body.messages, false)?,
-        max_output_tokens: body.max_completion_tokens.or(body.max_tokens),
-        temperature: body.temperature,
-        top_p: body.top_p,
-        stop,
-    };
-    validate(&request)?;
     let account_id = principal.account_id;
-    let stream = state.gateway.execute(principal, request, started).await?;
-    let request_id = stream.request_id;
-    tracing::info!(event = "api_request", %request_id, %account_id, body_json = %request_body);
-    let result = if body.stream {
-        chat_stream(
+    let token_id = match &principal.credential {
+        Credential::ApiToken(id) => Some(*id),
+        Credential::AllowedIp { .. } => None,
+    };
+    let (stream, request_body, model, streaming, include_usage) = async {
+        let Json(request_body) =
+            body.map_err(|_| invalid("Invalid Chat Completions JSON request"))?;
+        let body = ChatRequest::deserialize(&request_body)
+            .map_err(|_| invalid("Invalid or unsupported Chat Completions request"))?;
+        if body.n.is_some_and(|n| n != 1) {
+            return Err(invalid("Only n=1 is supported"));
+        }
+        if body.stream_options.is_some() && !body.stream {
+            return Err(invalid("stream_options requires stream=true"));
+        }
+        if body.max_tokens.is_some() && body.max_completion_tokens.is_some() {
+            return Err(invalid("Specify only one output token limit"));
+        }
+        let stop = match body.stop {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::String(text)) if !text.is_empty() => vec![text],
+            Some(Value::Array(values)) if !values.is_empty() && values.len() <= 4 => values
+                .into_iter()
+                .map(|value| match value {
+                    Value::String(text) if !text.is_empty() => Ok(text),
+                    _ => Err(invalid("Invalid stop sequence")),
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => return Err(invalid("stop must contain one to four nonempty strings")),
+        };
+        let (tools, tool_choice) = tools(
+            body.tools.unwrap_or_default(),
+            body.tool_choice,
+            false,
+            body.web_search_options,
+        )?;
+        let request = InferenceRequest {
+            tools,
+            tool_choice,
+            model: body.model.clone(),
+            messages: messages(body.messages, false)?,
+            max_output_tokens: body.max_completion_tokens.or(body.max_tokens),
+            temperature: body.temperature,
+            top_p: body.top_p,
+            stop,
+        };
+        validate(&request)?;
+        let stream = state.gateway.execute(principal, request, started).await?;
+        Ok::<_, ProxyError>((
             stream,
-            account_id,
+            request_body,
             body.model,
+            body.stream,
             body.stream_options
                 .is_some_and(|options| options.include_usage),
-        )
-        .await
+        ))
+    }
+    .await
+    .inspect_err(|error| state.metrics.rejected(token_id, error.kind))?;
+    let request_id = stream.request_id;
+    tracing::info!(event = "api_request", %request_id, %account_id, body_json = %request_body);
+    let result = if streaming {
+        chat_stream(stream, account_id, model, include_usage).await
     } else {
-        collect(stream, account_id, body.model, false).await
+        collect(stream, account_id, model, false).await
     };
     Ok(result.unwrap_or_else(|error| error.api_response(Some((request_id, account_id)))))
 }
@@ -584,53 +596,63 @@ async fn responses(
         peer.map(|Extension(ConnectInfo(addr))| addr.ip()),
     )
     .await?;
-    let Json(request_body) = body.map_err(|_| invalid("Invalid Responses JSON request"))?;
-    let body = ResponsesRequest::deserialize(&request_body)
-        .map_err(|_| invalid("Invalid or unsupported Responses request"))?;
-    if body.store == Some(true) {
-        return Err(invalid("Stored responses are not supported"));
-    }
-    let mut input = match body.input {
-        Value::String(text) => vec![Message {
-            role: Role::User,
-            content: text,
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-        }],
-        Value::Array(items) => response_messages(items)?,
-        _ => return Err(invalid("input must be text or an array of text messages")),
+    let account_id = principal.account_id;
+    let token_id = match &principal.credential {
+        Credential::ApiToken(id) => Some(*id),
+        Credential::AllowedIp { .. } => None,
     };
-    if let Some(instructions) = body.instructions {
-        input.insert(
-            0,
-            Message {
-                role: Role::System,
-                content: instructions,
+    let (stream, request_body, model, streaming) = async {
+        let Json(request_body) = body.map_err(|_| invalid("Invalid Responses JSON request"))?;
+        let body = ResponsesRequest::deserialize(&request_body)
+            .map_err(|_| invalid("Invalid or unsupported Responses request"))?;
+        if body.store == Some(true) {
+            return Err(invalid("Stored responses are not supported"));
+        }
+        let mut input = match body.input {
+            Value::String(text) => vec![Message {
+                role: Role::User,
+                content: text,
                 tool_calls: Vec::new(),
                 tool_call_id: None,
-            },
-        );
+            }],
+            Value::Array(items) => response_messages(items)?,
+            _ => return Err(invalid("input must be text or an array of text messages")),
+        };
+        if let Some(instructions) = body.instructions {
+            input.insert(
+                0,
+                Message {
+                    role: Role::System,
+                    content: instructions,
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                },
+            );
+        }
+        let (tools, tool_choice) =
+            tools(body.tools.unwrap_or_default(), body.tool_choice, true, None)?;
+        let request = InferenceRequest {
+            tools,
+            tool_choice,
+            model: body.model.clone(),
+            messages: input,
+            max_output_tokens: body.max_output_tokens,
+            temperature: body.temperature,
+            top_p: body.top_p,
+            stop: Vec::new(),
+        };
+        validate(&request)?;
+        let stream = state.gateway.execute(principal, request, started).await?;
+        Ok::<_, ProxyError>((stream, request_body, body.model, body.stream))
     }
-    let (tools, tool_choice) = tools(body.tools.unwrap_or_default(), body.tool_choice, true, None)?;
-    let request = InferenceRequest {
-        tools,
-        tool_choice,
-        model: body.model.clone(),
-        messages: input,
-        max_output_tokens: body.max_output_tokens,
-        temperature: body.temperature,
-        top_p: body.top_p,
-        stop: Vec::new(),
-    };
-    validate(&request)?;
-    let account_id = principal.account_id;
-    let stream = state.gateway.execute(principal, request, started).await?;
+    .await
+    .inspect_err(|error| state.metrics.rejected(token_id, error.kind))?;
     let request_id = stream.request_id;
     tracing::info!(event = "api_request", %request_id, %account_id, body_json = %request_body);
-    let result = if body.stream {
-        responses_stream(stream, account_id, body.model).await
+    let result = if streaming {
+        responses_stream(stream, account_id, model).await
     } else {
-        collect(stream, account_id, body.model, true).await
+        collect(stream, account_id, model, true).await
     };
     Ok(result.unwrap_or_else(|error| error.api_response(Some((request_id, account_id)))))
 }

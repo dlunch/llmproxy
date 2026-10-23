@@ -2,9 +2,10 @@ use std::{collections::HashMap, net::SocketAddr, process::ExitCode, sync::Arc, t
 
 use llmproxy::{
     api::{ApiState, router},
-    config::{Config, ProviderConfig},
-    core::Provider,
-    gateway::{Gateway, LeastUsedPolicy},
+    config::Config,
+    core::{Provider, ProviderKind},
+    gateway::{ConfiguredPolicy, Gateway},
+    management::{ManagementState, oauth::OAuthManager},
     metrics::Metrics,
     providers::{
         claude::{ClaudeAuth, ClaudeProvider},
@@ -61,44 +62,42 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .user_agent(concat!("llmproxy/", env!("CARGO_PKG_VERSION")))
         .build()?;
     let metrics = Arc::new(Metrics::default());
-    let mut providers = HashMap::<String, Arc<dyn Provider>>::new();
-    for provider in config.providers {
-        match provider {
-            ProviderConfig::Codex { id } => {
-                providers.insert(
-                    id.clone(),
-                    Arc::new(CodexProvider::new(
-                        id,
-                        store.clone(),
-                        client.clone(),
-                        CodexAuth::new(client.clone(), "https://auth.openai.com".into()),
-                        "https://chatgpt.com/backend-api/codex/responses".into(),
-                        metrics.clone(),
-                    )),
-                );
-            }
-            ProviderConfig::Claude { id, executable } => {
-                providers.insert(
-                    id.clone(),
-                    Arc::new(ClaudeProvider::new(
-                        id,
-                        executable,
-                        store.clone(),
-                        ClaudeAuth::new(
-                            client.clone(),
-                            "https://platform.claude.com/v1/oauth/token".into(),
-                        ),
-                        metrics.clone(),
-                    )),
-                );
-            }
-        }
-    }
+    let codex_auth = CodexAuth::new(client.clone(), "https://auth.openai.com".into());
+    let claude_auth = ClaudeAuth::new(
+        client.clone(),
+        "https://platform.claude.com/v1/oauth/token".into(),
+    );
+    let oauth = Arc::new(OAuthManager::new(
+        store.clone(),
+        codex_auth.clone(),
+        claude_auth.clone(),
+    ));
+    let providers = HashMap::<ProviderKind, Arc<dyn Provider>>::from([
+        (
+            ProviderKind::Codex,
+            Arc::new(CodexProvider::new(
+                store.clone(),
+                client.clone(),
+                codex_auth,
+                "https://chatgpt.com/backend-api/codex/responses".into(),
+                metrics.clone(),
+            )) as Arc<dyn Provider>,
+        ),
+        (
+            ProviderKind::Claude,
+            Arc::new(ClaudeProvider::new(
+                config.claude_executable,
+                store.clone(),
+                claude_auth,
+                metrics.clone(),
+            )) as Arc<dyn Provider>,
+        ),
+    ]);
     let maintenance_providers = providers.clone();
     let gateway = Arc::new(Gateway::new(
         store.clone(),
         providers,
-        Arc::new(LeastUsedPolicy),
+        Arc::new(ConfiguredPolicy),
         metrics.clone(),
         config.max_concurrent_requests,
         Duration::from_secs(config.request_timeout_seconds),
@@ -107,10 +106,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         gateway: gateway.clone(),
         store: store.clone(),
         metrics,
-    });
+    })
+    .merge(llmproxy::management::router(ManagementState::new(
+        store.clone(),
+        oauth.clone(),
+        config.cookie_secure,
+    )));
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let maintenance_stop = CancellationToken::new();
     let maintenance = tokio::spawn(maintain_credentials(
+        store.clone(),
         maintenance_providers,
         maintenance_stop.clone(),
     ));
@@ -123,6 +128,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     error_kind = error.kind.as_str(),
                     "Request reconciliation failed"
                 );
+            }
+            if let Err(error) = store.cleanup_expired_sessions().await {
+                tracing::error!(error_kind = error.kind.as_str(), "Session cleanup failed");
             }
         }
     });
@@ -150,6 +158,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     .await;
     maintenance_stop.cancel();
     let maintenance_result = maintenance.await;
+    oauth.shutdown().await;
     gateway.shutdown().await;
     reconciliation.abort();
     let _ = reconciliation.await;

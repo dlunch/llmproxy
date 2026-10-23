@@ -8,7 +8,7 @@ use llmproxy::{
         EventStream, FinishReason, InferenceRequest, Message, Provider, ProviderEvent, ProxyError,
         Role, Usage,
     },
-    gateway::{Gateway, LeastUsedPolicy, Route, RoutingPolicy},
+    gateway::{ConfiguredPolicy, Gateway, Route, RoutingPolicy},
     metrics::Metrics,
     store::{PgStore, QuotaWindow},
 };
@@ -26,27 +26,28 @@ impl RoutingPolicy for ScopedPolicy {
     fn select(
         &self,
         request: &InferenceRequest,
-        account: &llmproxy::core::AccountUsage,
+        account: &llmproxy::core::RoutingContext,
         routes: &[Route],
         states: &[llmproxy::store::ProviderState],
     ) -> Result<usize, ProxyError> {
         assert!(
             routes
                 .iter()
-                .all(|route| self.owners[&route.provider_id] == account.account_id)
+                .all(|route| self.owners[&route.provider_id] == account.usage.account_id)
         );
         assert!(
             states
                 .iter()
-                .all(|state| self.owners[&state.provider_id] == account.account_id)
+                .all(|state| self.owners[&state.provider_id] == account.usage.account_id)
         );
-        LeastUsedPolicy.select(request, account, routes, states)
+        ConfiguredPolicy.select(request, account, routes, states)
     }
 }
 #[async_trait]
 impl Provider for FakeProvider {
     async fn infer(
         &self,
+        _: &str,
         request: InferenceRequest,
         _: CancellationToken,
     ) -> Result<EventStream, ProxyError> {
@@ -183,7 +184,7 @@ async fn postgres_gateway_lifecycle_routing_and_cancellation() {
         (&b, account_id),
         (&foreign, other_account),
     ] {
-        sqlx::query("INSERT INTO provider_instances(id,account_id) VALUES ($1,$2)")
+        sqlx::query("INSERT INTO provider_instances(id,account_id,kind,label) VALUES ($1,$2,'codex','Fixture')")
             .bind(id)
             .bind(owner)
             .execute(&pool)
@@ -206,11 +207,10 @@ async fn postgres_gateway_lifecycle_routing_and_cancellation() {
         .await
         .unwrap();
     }
-    let providers: HashMap<String, Arc<dyn Provider>> = HashMap::from([
-        (a.clone(), Arc::new(FakeProvider) as Arc<dyn Provider>),
-        (b.clone(), Arc::new(FakeProvider) as Arc<dyn Provider>),
-        (foreign.clone(), Arc::new(FakeProvider) as Arc<dyn Provider>),
-    ]);
+    let providers = HashMap::from([(
+        llmproxy::core::ProviderKind::Codex,
+        Arc::new(FakeProvider) as Arc<dyn Provider>,
+    )]);
     let metrics = Arc::new(Metrics::default());
     let gateway = Gateway::new(
         store.clone(),
@@ -319,6 +319,7 @@ async fn postgres_gateway_lifecycle_routing_and_cancellation() {
     store
         .save_quota(
             &a,
+            0,
             &[
                 QuotaWindow {
                     key: "short".into(),
@@ -392,10 +393,7 @@ async fn postgres_gateway_lifecycle_routing_and_cancellation() {
         }
     });
     futures_util::future::join_all(concurrent).await;
-    let states = store
-        .provider_states(account_id, &[a.clone(), b.clone(), foreign.clone()])
-        .await
-        .unwrap();
+    let states = store.provider_states(account_id).await.unwrap();
     assert_eq!(states.len(), 2);
     assert_eq!(states.iter().map(|s| s.accumulated_tokens).sum::<u64>(), 35);
     assert_eq!(
@@ -429,6 +427,7 @@ async fn postgres_gateway_lifecycle_routing_and_cancellation() {
     store
         .save_quota(
             &b,
+            0,
             &[QuotaWindow {
                 key: "long".into(),
                 observed_at: Utc::now(),
@@ -551,7 +550,12 @@ async fn postgres_gateway_lifecycle_routing_and_cancellation() {
             .unwrap();
     assert!(identity.0.is_none());
     assert_eq!(identity.1.unwrap().ip(), client_ip);
-    let usage = store.account_usage(account_id).await.unwrap();
+    let usage = store
+        .routing_snapshot(account_id, "test")
+        .await
+        .unwrap()
+        .0
+        .usage;
     assert_eq!(usage.account_id, account_id);
     assert_eq!(usage.input_tokens + usage.output_tokens, 42);
     let specific_range = Uuid::new_v4();
@@ -619,7 +623,12 @@ async fn postgres_gateway_lifecycle_routing_and_cancellation() {
     while let Some(event) = second_identity.next().await {
         event.unwrap();
     }
-    let usage = store.account_usage(account_id).await.unwrap();
+    let usage = store
+        .routing_snapshot(account_id, "test")
+        .await
+        .unwrap()
+        .0
+        .usage;
     assert_eq!(usage.input_tokens + usage.output_tokens, 47);
     let mut timed_with_usage = gateway
         .execute(
@@ -665,7 +674,12 @@ async fn postgres_gateway_lifecycle_routing_and_cancellation() {
         .await
         .unwrap();
     assert_eq!(outcome, "cancelled");
-    let usage = store.account_usage(account_id).await.unwrap();
+    let usage = store
+        .routing_snapshot(account_id, "test")
+        .await
+        .unwrap()
+        .0
+        .usage;
     assert_eq!(usage.input_tokens + usage.output_tokens, 51);
     let totals_match: bool = sqlx::query_scalar("SELECT p.input_tokens=COALESCE(sum(r.input_tokens),0) AND p.output_tokens=COALESCE(sum(r.output_tokens),0) FROM provider_instances p LEFT JOIN requests r ON r.provider_id=p.id WHERE p.id=$1 GROUP BY p.id")
         .bind(&b).fetch_one(&pool).await.unwrap();
@@ -793,6 +807,7 @@ async fn usage_migration_and_mutations_preserve_atomic_totals() {
         .unwrap();
     sqlx::query("INSERT INTO requests(id,account_id,api_token_id,requested_model,provider_id,upstream_model,started_at,deadline_at,outcome,input_tokens) VALUES ($1,$2,$3,'test','provider','test',now(),now(),'failed',11)")
         .bind(historical).bind(account).bind(token).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO provider_credentials(provider_id,access_token,refresh_token,account_id) VALUES ('provider','access','refresh','upstream')").execute(&pool).await.unwrap();
     let store = PgStore::new(pool.clone());
     store.migrate().await.unwrap();
     let totals: (i64, i64) =
@@ -802,21 +817,27 @@ async fn usage_migration_and_mutations_preserve_atomic_totals() {
             .await
             .unwrap();
     assert_eq!(totals, (11, 0));
-    let usage = store.account_usage(account).await.unwrap();
+    let usage = store
+        .routing_snapshot(account, "test")
+        .await
+        .unwrap()
+        .0
+        .usage;
     assert_eq!((usage.input_tokens, usage.output_tokens), (11, 0));
     assert_eq!(
-        store
-            .provider_states(account, &["provider".into()])
-            .await
-            .unwrap()[0]
-            .accumulated_tokens,
+        store.provider_states(account).await.unwrap()[0].accumulated_tokens,
         11
     );
 
     let inserted = Uuid::new_v4();
     sqlx::query("INSERT INTO requests(id,account_id,api_token_id,requested_model,provider_id,upstream_model,started_at,deadline_at,outcome,input_tokens,output_tokens) VALUES ($1,$2,$3,'test','provider','test',now(),now(),'succeeded',2,4)")
         .bind(inserted).bind(account).bind(token).execute(&pool).await.unwrap();
-    let usage = store.account_usage(account).await.unwrap();
+    let usage = store
+        .routing_snapshot(account, "test")
+        .await
+        .unwrap()
+        .0
+        .usage;
     assert_eq!((usage.input_tokens, usage.output_tokens), (13, 4));
     sqlx::query("DELETE FROM requests WHERE id=$1")
         .bind(inserted)
@@ -848,21 +869,36 @@ async fn usage_migration_and_mutations_preserve_atomic_totals() {
         store.finish_request(running, "cancelled", None, Some(&usage))
     );
     assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
-    let usage = store.account_usage(account).await.unwrap();
+    let usage = store
+        .routing_snapshot(account, "test")
+        .await
+        .unwrap()
+        .0
+        .usage;
     assert_eq!((usage.input_tokens, usage.output_tokens), (14, 5));
     sqlx::query("UPDATE requests SET input_tokens=7,output_tokens=2 WHERE id=$1")
         .bind(historical)
         .execute(&pool)
         .await
         .unwrap();
-    let usage = store.account_usage(account).await.unwrap();
+    let usage = store
+        .routing_snapshot(account, "test")
+        .await
+        .unwrap()
+        .0
+        .usage;
     assert_eq!((usage.input_tokens, usage.output_tokens), (10, 7));
     sqlx::query("DELETE FROM requests WHERE id=$1")
         .bind(historical)
         .execute(&pool)
         .await
         .unwrap();
-    let usage = store.account_usage(account).await.unwrap();
+    let usage = store
+        .routing_snapshot(account, "test")
+        .await
+        .unwrap()
+        .0
+        .usage;
     assert_eq!((usage.input_tokens, usage.output_tokens), (3, 5));
 
     let unsaved = Uuid::new_v4();
@@ -903,14 +939,15 @@ async fn usage_migration_and_mutations_preserve_atomic_totals() {
             .await
             .unwrap();
     assert_eq!(row, ("running".into(), None, None));
-    let usage = store.account_usage(account).await.unwrap();
+    let usage = store
+        .routing_snapshot(account, "test")
+        .await
+        .unwrap()
+        .0
+        .usage;
     assert_eq!((usage.input_tokens, usage.output_tokens), (3, 5));
     assert_eq!(
-        store
-            .provider_states(account, &["provider".into()])
-            .await
-            .unwrap()[0]
-            .accumulated_tokens,
+        store.provider_states(account).await.unwrap()[0].accumulated_tokens,
         8
     );
     sqlx::query("ALTER TABLE provider_instances DROP CONSTRAINT test_counter_failure")
@@ -922,6 +959,7 @@ async fn usage_migration_and_mutations_preserve_atomic_totals() {
     store
         .save_quota(
             "provider",
+            0,
             &[
                 QuotaWindow {
                     key: "short".into(),
@@ -943,6 +981,7 @@ async fn usage_migration_and_mutations_preserve_atomic_totals() {
         store
             .save_quota(
                 "provider",
+                0,
                 &[
                     QuotaWindow {
                         key: "short".into(),
@@ -964,6 +1003,7 @@ async fn usage_migration_and_mutations_preserve_atomic_totals() {
     store
         .save_quota(
             "provider",
+            0,
             &[
                 QuotaWindow {
                     key: "short".into(),
@@ -1008,7 +1048,7 @@ async fn usage_migration_and_mutations_preserve_atomic_totals() {
             if index % 2 == 0 {
                 windows.reverse();
             }
-            store.save_quota("provider", &windows).await.unwrap();
+            store.save_quota("provider", 0, &windows).await.unwrap();
         }
     });
     futures_util::future::join_all(writes).await;
@@ -1019,7 +1059,45 @@ async fn usage_migration_and_mutations_preserve_atomic_totals() {
     .await
     .unwrap();
     assert_eq!(windows, vec![("long".into(), 0.5), ("short".into(), 0.5)]);
-    store.save_quota("provider", &[]).await.unwrap();
+    store.save_quota("provider", 0, &[]).await.unwrap();
+    sqlx::query("UPDATE provider_instances SET login_generation=1 WHERE id='provider'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        store.provider_states(account).await.unwrap()[0]
+            .quota
+            .is_empty()
+    );
+    store
+        .save_quota(
+            "provider",
+            1,
+            &[QuotaWindow {
+                key: "short".into(),
+                observed_at: now - chrono::Duration::seconds(1),
+                remaining_fraction: 0.75,
+                resets_at: None,
+            }],
+        )
+        .await
+        .unwrap();
+    store
+        .save_quota(
+            "provider",
+            0,
+            &[QuotaWindow {
+                key: "short".into(),
+                observed_at: now + chrono::Duration::hours(1),
+                remaining_fraction: 0.0,
+                resets_at: None,
+            }],
+        )
+        .await
+        .unwrap();
+    let states = store.provider_states(account).await.unwrap();
+    assert_eq!(states[0].quota.len(), 1);
+    assert_eq!(states[0].quota[0].remaining_fraction, 0.75);
     pool.close().await;
     sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
         .execute(&admin)

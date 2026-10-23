@@ -4,15 +4,19 @@ pub mod codex;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use chrono::{DateTime, Utc};
-use futures_util::future::join_all;
+use futures_util::{StreamExt, stream};
 use reqwest::Response;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::core::{ErrorKind, Provider, ProxyError};
+use crate::{
+    core::{ErrorKind, Provider, ProviderKind, ProxyError},
+    store::PgStore,
+};
 
 pub async fn maintain_credentials(
-    providers: HashMap<String, Arc<dyn Provider>>,
+    store: PgStore,
+    providers: HashMap<ProviderKind, Arc<dyn Provider>>,
     stop: CancellationToken,
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(60));
@@ -23,17 +27,37 @@ pub async fn maintain_credentials(
             _ = stop.cancelled() => break,
             _ = interval.tick() => {},
         }
-        // Once refresh starts, drain it through persistence even during shutdown.
-        join_all(providers.iter().map(|(provider_id, provider)| async move {
-            if let Err(error) = provider.refresh_credentials().await {
+        let configured = match store.enabled_providers().await {
+            Ok(providers) => providers,
+            Err(error) => {
                 tracing::warn!(
-                    provider_id,
                     error_kind = error.kind.as_str(),
-                    "OAuth credential refresh failed"
+                    "Cannot load providers for credential refresh"
                 );
+                continue;
             }
-        }))
-        .await;
+        };
+        // Once refresh starts, drain it through persistence even during shutdown.
+        stream::iter(configured.iter())
+            .for_each_concurrent(4, |(provider_id, kind)| {
+                let provider = providers.get(kind);
+                let stop = &stop;
+                async move {
+                    if stop.is_cancelled() {
+                        return;
+                    }
+                    if let Some(provider) = provider
+                        && let Err(error) = provider.refresh_credentials(provider_id).await
+                    {
+                        tracing::warn!(
+                            provider_id,
+                            error_kind = error.kind.as_str(),
+                            "OAuth credential refresh failed"
+                        );
+                    }
+                }
+            })
+            .await;
     }
 }
 

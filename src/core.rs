@@ -23,6 +23,27 @@ pub struct AccountUsage {
     pub output_tokens: u64,
 }
 
+#[derive(Clone, Copy, Hash, PartialEq, Eq, serde::Deserialize, serde::Serialize, sqlx::Type)]
+#[serde(rename_all = "snake_case")]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
+pub enum ProviderKind {
+    Codex,
+    Claude,
+}
+
+#[derive(Clone, Copy, serde::Deserialize, serde::Serialize, sqlx::Type)]
+#[serde(rename_all = "snake_case")]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
+pub enum RoutingStrategy {
+    LeastUsed,
+    Priority,
+}
+
+pub struct RoutingContext {
+    pub usage: AccountUsage,
+    pub strategy: RoutingStrategy,
+}
+
 pub struct Message {
     pub role: Role,
     pub content: String,
@@ -120,11 +141,12 @@ pub type EventStream = Pin<Box<dyn Stream<Item = Result<ProviderEvent, ProxyErro
 pub trait Provider: Send + Sync {
     async fn infer(
         &self,
+        provider_id: &str,
         request: InferenceRequest,
         cancellation: CancellationToken,
     ) -> Result<EventStream, ProxyError>;
 
-    async fn refresh_credentials(&self) -> Result<(), ProxyError> {
+    async fn refresh_credentials(&self, _provider_id: &str) -> Result<(), ProxyError> {
         Ok(())
     }
 
@@ -135,6 +157,8 @@ pub trait Provider: Send + Sync {
 pub enum ErrorKind {
     InvalidRequest,
     Unauthorized,
+    NotFound,
+    Conflict,
     ModelNotFound,
     QuotaExceeded,
     Unavailable,
@@ -150,6 +174,8 @@ impl ErrorKind {
         match self {
             Self::InvalidRequest => "invalid_request",
             Self::Unauthorized => "unauthorized",
+            Self::NotFound => "not_found",
+            Self::Conflict => "conflict",
             Self::ModelNotFound => "model_not_found",
             Self::QuotaExceeded => "quota_exceeded",
             Self::Unavailable => "unavailable",
@@ -181,5 +207,7 @@ impl ProxyError {
 pub struct Route {
     pub model: String,
     pub provider_id: String,
+    pub provider_kind: ProviderKind,
     pub upstream_model: String,
+    pub priority: i32,
 }

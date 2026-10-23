@@ -1,4 +1,4 @@
-use std::{collections::HashSet, net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddr, path::PathBuf};
 
 use serde::Deserialize;
 
@@ -8,7 +8,8 @@ pub struct Config {
     pub listen: SocketAddr,
     pub max_concurrent_requests: usize,
     pub request_timeout_seconds: u64,
-    pub providers: Vec<ProviderConfig>,
+    pub claude_executable: PathBuf,
+    pub cookie_secure: bool,
 }
 
 impl Default for Config {
@@ -17,16 +18,10 @@ impl Default for Config {
             listen: "127.0.0.1:8080".parse().expect("static address"),
             max_concurrent_requests: 16,
             request_timeout_seconds: 120,
-            providers: vec![],
+            claude_executable: "/usr/local/bin/claude".into(),
+            cookie_secure: true,
         }
     }
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ProviderConfig {
-    Codex { id: String },
-    Claude { id: String, executable: PathBuf },
 }
 
 impl Config {
@@ -39,20 +34,8 @@ impl Config {
         if !(1..=86400).contains(&self.request_timeout_seconds) {
             return Err("request_timeout_seconds must be between 1 and 86400".into());
         }
-        let mut ids = HashSet::new();
-        for provider in &self.providers {
-            let id = match provider {
-                ProviderConfig::Codex { id } => id,
-                ProviderConfig::Claude { id, executable } => {
-                    if !executable.is_absolute() {
-                        return Err("Claude executable must be an absolute path".into());
-                    }
-                    id
-                }
-            };
-            if id.is_empty() || !ids.insert(id) {
-                return Err("Provider IDs must be nonempty and unique".into());
-            }
+        if !self.claude_executable.is_absolute() {
+            return Err("Claude executable must be an absolute path".into());
         }
         Ok(())
     }

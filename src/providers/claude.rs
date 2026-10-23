@@ -7,11 +7,13 @@ use std::{
 };
 
 use async_trait::async_trait;
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use sqlx::{Postgres, Transaction};
 use tokio::{
     io::AsyncWriteExt,
@@ -36,6 +38,14 @@ use crate::store::{ClaudeCredentials, PgStore, QuotaWindow};
 
 const DEFAULT_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const DEFAULT_SCOPES: &str = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload user:plugins";
+const MANUAL_REDIRECT_URL: &str = "https://platform.claude.com/oauth/code/callback";
+
+pub(crate) struct ClaudeLogin {
+    pub authorization_url: String,
+    pub state: String,
+    pub code_verifier: String,
+    pub expires_at: DateTime<Utc>,
+}
 
 #[derive(Clone)]
 pub struct ClaudeAuth {
@@ -50,11 +60,82 @@ struct TokenResponse {
     refresh_token: Option<String>,
     scope: Option<String>,
     refresh_token_expires_in: Option<i64>,
+    account: Option<Value>,
+    organization: Option<Value>,
 }
 
 impl ClaudeAuth {
     pub fn new(client: Client, token_url: String) -> Self {
         Self { client, token_url }
+    }
+
+    pub(crate) fn start_login(&self) -> ClaudeLogin {
+        let code_verifier = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let state = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.as_bytes()));
+        let mut url = reqwest::Url::parse("https://claude.com/cai/oauth/authorize")
+            .expect("static Claude authorization URL");
+        url.query_pairs_mut().extend_pairs([
+            ("code", "true"),
+            ("client_id", DEFAULT_CLIENT_ID),
+            ("response_type", "code"),
+            ("redirect_uri", MANUAL_REDIRECT_URL),
+            ("scope", &format!("org:create_api_key {DEFAULT_SCOPES}")),
+            ("code_challenge", challenge.as_str()),
+            ("code_challenge_method", "S256"),
+            ("state", state.as_str()),
+        ]);
+        ClaudeLogin {
+            authorization_url: url.into(),
+            state,
+            code_verifier,
+            expires_at: Utc::now() + chrono::Duration::minutes(15),
+        }
+    }
+
+    pub(crate) async fn complete_login(
+        &self,
+        code: &str,
+        state: &str,
+        code_verifier: &str,
+    ) -> Result<ClaudeCredentials, ProxyError> {
+        let response = self.client.post(&self.token_url)
+            .timeout(Duration::from_secs(30))
+            .json(&json!({"grant_type":"authorization_code","code":code,"state":state,
+                "code_verifier":code_verifier,"client_id":DEFAULT_CLIENT_ID,"redirect_uri":MANUAL_REDIRECT_URL}))
+            .send().await.map_err(|_| ProxyError::new(ErrorKind::UpstreamAuth,"Claude login exchange failed"))?;
+        let tokens: TokenResponse =
+            serde_json::from_value(auth_json(response).await?).map_err(|_| {
+                ProxyError::new(ErrorKind::UpstreamAuth, "Invalid Claude token response")
+            })?;
+        if tokens.refresh_token.as_ref().is_none_or(String::is_empty)
+            || !tokens.scope.as_deref().is_some_and(|scopes| {
+                scopes
+                    .split_whitespace()
+                    .any(|scope| scope == "user:inference")
+            })
+        {
+            return Err(ProxyError::new(
+                ErrorKind::UpstreamAuth,
+                "Claude login did not grant renewable inference access",
+            ));
+        }
+        let oauth_account = tokens.account.as_ref().and_then(|account| {
+            account["uuid"].as_str().map(|uuid| {
+                json!({"accountUuid":uuid,"emailAddress":account["email_address"],
+                    "organizationUuid":tokens.organization.as_ref().and_then(|organization| organization["uuid"].as_str())})
+            })
+        });
+        let mut oauth = serde_json::Map::new();
+        tokens.apply(&mut oauth)?;
+        Ok(ClaudeCredentials {
+            credentials: json!({"claudeAiOauth":oauth}),
+            oauth_account,
+            user_id: None,
+            has_completed_onboarding: true,
+            updated_at: Utc::now(),
+            login_generation: 0,
+        })
     }
 
     async fn refresh(
@@ -90,30 +171,41 @@ impl ClaudeAuth {
             || ProxyError::new(ErrorKind::UpstreamAuth, "Invalid Claude token response");
         let tokens: TokenResponse =
             serde_json::from_value(auth_json(response).await?).map_err(|_| invalid_response())?;
-        if tokens.access_token.is_empty()
-            || tokens.expires_in <= 0
-            || tokens.refresh_token.as_ref().is_some_and(String::is_empty)
+        tokens.apply(oauth)
+    }
+}
+
+impl TokenResponse {
+    fn apply(self, oauth: &mut serde_json::Map<String, Value>) -> Result<(), ProxyError> {
+        let invalid_response =
+            || ProxyError::new(ErrorKind::UpstreamAuth, "Invalid Claude token response");
+        if self.access_token.is_empty()
+            || self.expires_in <= 0
+            || self.refresh_token.as_ref().is_some_and(String::is_empty)
         {
             return Err(invalid_response());
         }
         let now = Utc::now();
-        let expires = chrono::Duration::try_seconds(tokens.expires_in)
+        let expires = chrono::Duration::try_seconds(self.expires_in)
             .and_then(|duration| now.checked_add_signed(duration))
             .ok_or_else(invalid_response)?;
-        let refresh_expires = tokens
+        let refresh_expires = self
             .refresh_token_expires_in
             .map(|seconds| {
+                if seconds <= 0 {
+                    return Err(invalid_response());
+                }
                 chrono::Duration::try_seconds(seconds)
                     .and_then(|duration| now.checked_add_signed(duration))
                     .ok_or_else(invalid_response)
             })
             .transpose()?;
-        oauth.insert("accessToken".into(), json!(tokens.access_token));
+        oauth.insert("accessToken".into(), json!(self.access_token));
         oauth.insert("expiresAt".into(), json!(expires.timestamp_millis()));
-        if let Some(refresh_token) = tokens.refresh_token {
+        if let Some(refresh_token) = self.refresh_token {
             oauth.insert("refreshToken".into(), json!(refresh_token));
         }
-        if let Some(scope) = tokens.scope {
+        if let Some(scope) = self.scope {
             oauth.insert(
                 "scopes".into(),
                 json!(scope.split_whitespace().collect::<Vec<_>>()),
@@ -131,7 +223,6 @@ impl ClaudeAuth {
 
 #[derive(Clone)]
 pub struct ClaudeProvider {
-    id: String,
     store: PgStore,
     workers: TaskTracker,
     executable: PathBuf,
@@ -141,7 +232,6 @@ pub struct ClaudeProvider {
 
 impl ClaudeProvider {
     pub fn new(
-        id: String,
         executable: PathBuf,
         store: PgStore,
         auth: ClaudeAuth,
@@ -150,7 +240,6 @@ impl ClaudeProvider {
         Self {
             executable,
             auth,
-            id,
             store,
             workers: TaskTracker::new(),
             metrics,
@@ -159,14 +248,15 @@ impl ClaudeProvider {
 
     async fn credentials(
         &self,
-        rejected_token: Option<&str>,
+        provider_id: &str,
+        rejected: Option<(&str, i64)>,
         cancellation: &CancellationToken,
     ) -> Result<ClaudeCredentials, ProxyError> {
-        if rejected_token.is_none() {
+        if rejected.is_none() {
             let timer = self.metrics.time_stage(Stage::CredentialRead);
             let loaded = tokio::select! {
                 _ = cancellation.cancelled() => Err(ProxyError::new(ErrorKind::Cancelled, "Request cancelled")),
-                result = self.store.claude_credentials(&self.id) => result,
+                result = self.store.claude_credentials(provider_id) => result,
             };
             drop(timer);
             let credentials = loaded?;
@@ -191,25 +281,32 @@ impl ClaudeProvider {
         let timer = self.metrics.time_stage(Stage::CredentialLock);
         let locked = tokio::select! {
             _ = cancellation.cancelled() => Err(ProxyError::new(ErrorKind::Cancelled, "Request cancelled")),
-            result = self.store.lock_claude_credentials(&self.id) => result,
+            result = self.store.lock_claude_credentials(provider_id) => result,
         };
         drop(timer);
         let (transaction, credentials) = locked?;
+        if rejected.is_some_and(|(_, generation)| generation != credentials.login_generation) {
+            return Err(ProxyError::new(
+                ErrorKind::UpstreamAuth,
+                "Provider login changed during request",
+            ));
+        }
         tokio::select! {
             _ = cancellation.cancelled() => Err(ProxyError::new(ErrorKind::Cancelled, "Request cancelled")),
-            result = self.refresh_locked_credentials(transaction, credentials, rejected_token, Stage::CredentialRefresh) => result,
+            result = self.refresh_locked_credentials(provider_id, transaction, credentials, rejected.map(|(token, _)| token), Stage::CredentialRefresh) => result,
         }
     }
 
     async fn refresh_locked_credentials(
         &self,
+        provider_id: &str,
         transaction: Transaction<'static, Postgres>,
         mut credentials: ClaudeCredentials,
         rejected_token: Option<&str>,
         refresh_stage: Stage,
     ) -> Result<ClaudeCredentials, ProxyError> {
         let auth = self.auth.clone();
-        let id = self.id.clone();
+        let id = provider_id.to_owned();
         let metrics = self.metrics.clone();
         let rejected_token = rejected_token.map(str::to_owned);
         // Once an exchange starts, cancellation cannot discard the rotated refresh token.
@@ -272,14 +369,15 @@ impl ClaudeProvider {
 
 #[async_trait]
 impl Provider for ClaudeProvider {
-    async fn refresh_credentials(&self) -> Result<(), ProxyError> {
+    async fn refresh_credentials(&self, provider_id: &str) -> Result<(), ProxyError> {
         let timer = self.metrics.time_stage(Stage::MaintenanceCredentialLock);
-        let locked = self.store.try_lock_claude_credentials(&self.id).await;
+        let locked = self.store.try_lock_claude_credentials(provider_id).await;
         drop(timer);
         let Some((transaction, credentials)) = locked? else {
             return Ok(());
         };
         self.refresh_locked_credentials(
+            provider_id,
             transaction,
             credentials,
             None,
@@ -296,6 +394,7 @@ impl Provider for ClaudeProvider {
 
     async fn infer(
         &self,
+        provider_id: &str,
         request: InferenceRequest,
         cancellation: CancellationToken,
     ) -> Result<EventStream, ProxyError> {
@@ -340,7 +439,8 @@ impl Provider for ClaudeProvider {
                 }
             }
         }
-        let credentials = self.credentials(None, &cancellation).await?;
+        let credentials = self.credentials(provider_id, None, &cancellation).await?;
+        let login_generation = credentials.login_generation;
         let mut access_token = credentials.credentials["claudeAiOauth"]["accessToken"]
             .as_str()
             .filter(|token| !token.is_empty())
@@ -551,7 +651,7 @@ impl Provider for ClaudeProvider {
         let mut stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
         let (sender, receiver) = mpsc::channel(16);
-        let id = self.id.clone();
+        let id = provider_id.to_owned();
         let store = self.store.clone();
         let provider = self.clone();
         self.workers.spawn(async move {
@@ -560,6 +660,7 @@ impl Provider for ClaudeProvider {
             let mut quota = HashMap::new();
             let quota_updates = &mut quota;
             let callback_cancellation = cancellation.clone();
+            let callback_id = id.clone();
             let stream = async_stream::try_stream! {
             // The SDK control protocol exposes client functions without executing host code.
             write_message(&mut stdin, &json!({"type":"control_request","request_id":"proxy-init","request":{"subtype":"initialize","hooks":null}})).await?;
@@ -601,7 +702,7 @@ impl Provider for ClaudeProvider {
                         }
                     }
                     Some("control_request") if message["request"]["subtype"] == "oauth_token_refresh" => {
-                        let refreshed = provider.credentials(Some(&access_token), &callback_cancellation).await?;
+                        let refreshed = provider.credentials(&callback_id, Some((&access_token, login_generation)), &callback_cancellation).await?;
                         let replacement = refreshed.credentials["claudeAiOauth"]["accessToken"].as_str()
                             .filter(|token| !token.is_empty())
                             .ok_or_else(|| ProxyError::new(ErrorKind::UpstreamAuth, "Claude access token missing"))?;
@@ -744,7 +845,7 @@ impl Provider for ClaudeProvider {
             let saved = async {
                 stopped.map_err(|_| ProxyError::new(ErrorKind::Upstream, "Cannot stop Claude process"))?;
                 if !quota.is_empty() {
-                    store.save_quota(&id, &quota.into_values().collect::<Vec<_>>()).await?;
+                    store.save_quota(&id, login_generation, &quota.into_values().collect::<Vec<_>>()).await?;
                 }
                 Ok::<_, ProxyError>(())
             }.await;
