@@ -84,6 +84,11 @@ for custom_config in (False, True):
         assert service["ports"] == [{"name": "http", "port": 8080, "targetPort": "http"}]
         assert deployment["strategy"]["type"] == "RollingUpdate"
         assert pod["automountServiceAccountToken"] is False
+        assert pod["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"] == {
+            "nodeSelectorTerms": [{"matchExpressions": [{
+                "key": "kubernetes.io/arch", "operator": "In", "values": ["amd64", "arm64"],
+            }]}],
+        }
         assert pod["securityContext"] == {
             "runAsNonRoot": True, "runAsUser": 1000, "runAsGroup": 1000, "fsGroup": 1000,
         }
