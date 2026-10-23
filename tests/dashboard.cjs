@@ -20,14 +20,20 @@ const { chromium } = require("playwright");
   try {
     await page.goto(base);
     await page.locator("#login-form").waitFor({ state: "visible" });
+    assert.equal(await page.locator("html").getAttribute("lang"), "en");
+    assert.equal(await page.title(), "llmproxy · Dashboard");
     if (screenshots) {
       await mkdir(screenshots, { recursive: true });
       await page.screenshot({ path: `${screenshots}/login.png`, fullPage: true });
     }
+    await page.setViewportSize({ width: 390, height: 844 });
+    assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+    if (screenshots) await page.screenshot({ path: `${screenshots}/mobile-login.png`, fullPage: true });
+    await page.setViewportSize({ width: 1440, height: 1000 });
     const { apiUrl } = await (await context.request.get(`${base}/config.json`)).json();
     assert.notEqual(new URL(base).origin, new URL(apiUrl).origin, "exercise cross-origin cookies");
     await page.locator("#signup-tab").click();
-    await page.locator("#signup-label").fill("개인 워크스페이스");
+    await page.locator("#signup-label").fill("Personal workspace");
     await page.locator("#signup-email").fill(email);
     await page.locator("#signup-password").fill(password);
     await page.locator("#signup-code").fill(signupCode);
@@ -43,7 +49,7 @@ const { chromium } = require("playwright");
 
     await page.locator('nav [data-view="tokens"]').click();
     const tokens = [];
-    const labels = ['개발 <img src=x onerror="window.__xss=true">', "운영 앱"];
+    const labels = ['Development <img src=x onerror="window.__xss=true">', "Production app"];
     for (const label of labels) {
       await page.locator("#token-label").fill(label);
       const response = page.waitForResponse((response) => response.url() === `${apiUrl}/management/api-tokens` && response.request().method() === "POST");
@@ -64,7 +70,7 @@ const { chromium } = require("playwright");
 
     await page.locator('nav [data-view="providers"]').click();
     const providers = [];
-    for (const [kind, label] of [["codex", "개인 Codex"], ["claude", "개인 Claude"]]) {
+    for (const [kind, label] of [["codex", "Personal Codex"], ["claude", "Personal Claude"]]) {
       await page.locator("#provider-kind").selectOption(kind);
       await page.locator("#provider-label").fill(label);
       const response = page.waitForResponse((response) => response.url() === `${apiUrl}/management/providers` && response.request().method() === "POST");
@@ -73,12 +79,12 @@ const { chromium } = require("playwright");
       await page.locator(`.provider-card[data-provider-id="${providers.at(-1).id}"]`).waitFor();
     }
     const codex = page.locator(`.provider-card[data-provider-id="${providers[0].id}"]`);
-    await codex.locator('[name="label"]').fill("기본 Codex");
+    await codex.locator('[name="label"]').fill("Primary Codex");
     await codex.locator('[name="enabled"]').uncheck();
     await codex.locator('button[type="submit"]').click();
-    await codex.getByText("제공자 설정을 저장했습니다.").waitFor();
+    await codex.getByText("Provider settings saved.").waitFor();
     let saved = await (await context.request.get(`${apiUrl}/management/providers/${providers[0].id}`)).json();
-    assert.equal(saved.label, "기본 Codex");
+    assert.equal(saved.label, "Primary Codex");
     assert.equal(saved.enabled, false);
     await codex.locator('[name="enabled"]').check();
     const enabled = page.waitForResponse((response) => response.url().endsWith(`/providers/${providers[0].id}`) && response.request().method() === "PATCH");
@@ -107,14 +113,14 @@ const { chromium } = require("playwright");
     });
     await codex.locator('[data-action="login"]').click();
     await page.locator("#device-code").getByText("TEST-CODE").waitFor();
-    await page.getByText("로그인을 완료하고 인증 정보를 저장했습니다.").waitFor();
+    await page.getByText("Sign-in complete. Credentials saved.").waitFor();
     assert.equal(polls, 2);
     await page.locator('#oauth-dialog button[data-close="oauth-dialog"]').last().click();
     const claude = page.locator(`.provider-card[data-provider-id="${providers[1].id}"]`);
     await claude.locator('[data-action="login"]').click();
     await page.locator("#oauth-code").fill("test-code#test-state");
     await page.locator("#oauth-code-form button[type=submit]").click();
-    await page.getByText("로그인을 완료하고 인증 정보를 저장했습니다.").waitFor();
+    await page.getByText("Sign-in complete. Credentials saved.").waitFor();
     assert.equal(submittedCode, "test-code#test-state");
     await page.locator('#oauth-dialog button[data-close="oauth-dialog"]').last().click();
     assert.equal(await page.locator("#oauth-code").inputValue(), "");
@@ -129,20 +135,20 @@ const { chromium } = require("playwright");
     await first.locator('[name="upstream_model"]').fill("test-model");
     await first.locator('[name="priority"]').fill("2");
     await page.locator("#routing-form button[type=submit]").click();
-    await page.getByText("모델 경로를 저장했습니다.").waitFor();
+    await page.getByText("Model routes saved.").waitFor();
     await page.locator("#add-route").click();
     const second = page.locator(".route-row").last();
     await second.locator('[name="model"]').fill("chat");
     await second.locator('[name="provider_id"]').selectOption(providers[0].id);
     await second.locator('[name="upstream_model"]').fill("duplicate");
     await page.locator("#routing-form button[type=submit]").click();
-    await page.getByText("같은 모델 이름과 제공자를 연결한 경로가 중복되어 있습니다.").waitFor();
+    await page.getByText("A route already exists for this model name and provider.").waitFor();
     assert.equal(await page.locator(".route-row").count(), 2);
     const routing = await (await context.request.get(`${apiUrl}/management/routing`)).json();
     assert.equal(routing.routes.length, 1);
     await second.locator('[name="provider_id"]').selectOption(providers[1].id);
     await page.locator("#routing-form button[type=submit]").click();
-    await page.getByText("모델 경로를 저장했습니다.").waitFor();
+    await page.getByText("Model routes saved.").waitFor();
 
     // A slow bootstrap read must not overwrite edits made after a newer refresh.
     let releaseRouting;
@@ -168,12 +174,12 @@ const { chromium } = require("playwright");
     const staleResponse = page.waitForResponse(`${apiUrl}/management/routing`);
     releaseRouting();
     await staleResponse;
-    await page.waitForFunction(() => document.getElementById("updated-at").textContent.includes("기준"));
+    await page.waitForFunction(() => document.getElementById("updated-at").textContent.includes("Updated at"));
     assert.equal(await page.locator('.route-row [name="model"]').first().inputValue(), "unsaved-route");
     await page.unroute(`${apiUrl}/management/routing`);
 
     await page.locator('nav [data-view="account"]').click();
-    await page.locator("#account-label").fill("운영 워크스페이스");
+    await page.locator("#account-label").fill("Production workspace");
     let releaseAccount;
     const accountGate = new Promise((resolve) => { releaseAccount = resolve; });
     let accountEntered;
@@ -190,15 +196,15 @@ const { chromium } = require("playwright");
       status: 503, contentType: "application/json", body: JSON.stringify({ error: { message: "Temporary failure" } }),
     }));
     await page.locator("#logout-button").click();
-    await page.getByText("로그아웃하지 못했습니다. Temporary failure", { exact: true }).waitFor();
-    assert.equal(await page.locator("#account-label").inputValue(), "운영 워크스페이스");
+    await page.getByText("Could not sign out. Temporary failure", { exact: true }).waitFor();
+    assert.equal(await page.locator("#account-label").inputValue(), "Production workspace");
     assert.equal(await page.locator("#account-label").isEnabled(), true);
     releaseAccount();
     await page.unroute(`${apiUrl}/management/account`);
     await page.unroute(`${apiUrl}/management/session`);
     await page.locator("#account-form button[type=submit]").click();
-    await page.getByText("계정 이름을 저장했습니다.").waitFor();
-    assert.equal(await page.locator("#sidebar-label").textContent(), "운영 워크스페이스");
+    await page.getByText("Account name saved.").waitFor();
+    assert.equal(await page.locator("#sidebar-label").textContent(), "Production workspace");
     await page.reload();
     await page.locator("#app").waitFor({ state: "visible" });
     await page.waitForFunction(() => document.getElementById("summary-requests").textContent === "0");
@@ -206,11 +212,16 @@ const { chromium } = require("playwright");
     await page.setViewportSize({ width: 390, height: 844 });
     assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
     if (screenshots) await page.screenshot({ path: `${screenshots}/mobile.png`, fullPage: true });
+    for (const view of ["tokens", "providers", "routing", "account"]) {
+      await page.locator(`nav [data-view="${view}"]`).click();
+      assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), `${view} fits on mobile`);
+      if (screenshots) await page.screenshot({ path: `${screenshots}/mobile-${view}.png`, fullPage: true });
+    }
     await page.setViewportSize({ width: 1440, height: 1000 });
 
     await page.locator('nav [data-view="tokens"]').click();
-    await page.getByRole("button", { name: "운영 앱 토큰 폐기", exact: true }).click();
-    await page.getByText("토큰을 폐기했습니다. 기존 사용 기록은 유지됩니다.").waitFor();
+    await page.getByRole("button", { name: "Revoke Production app token", exact: true }).click();
+    await page.getByText("Token revoked. Existing usage history is retained.").waitFor();
     const tokenList = await (await context.request.get(`${apiUrl}/management/api-tokens`)).json();
     assert.ok(tokenList.find((token) => token.id === tokens[1].id).revoked_at);
     let release;

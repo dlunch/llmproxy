@@ -8,7 +8,7 @@ A Rust subscription-backed LLM proxy with separate API, gateway, and provider mo
 - Client-defined function calls/results and native web search where the provider supports them.
 - Accounts with multiple API tokens and IP CIDRs; PostgreSQL request metadata and token usage belong to the account.
 - Email/password management sessions, signup codes, provider login, routing configuration, and per-token metrics.
-- A Korean static dashboard served by a separate Nginx image, calling the API directly from the browser.
+- An English static dashboard served by a separate Nginx image, calling the API directly from the browser.
 - JSON request/response and operational logs on stdout; Prometheus at `/metrics` and liveness at `/health`.
 
 ## Run
